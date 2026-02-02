@@ -1,0 +1,48 @@
+{
+  "models": [
+    {
+      "name": "qwen3:14b",
+      "description": "Qwen 3 14B - Large multilingual model with strong reasoning capabilities. Good for complex tasks, coding, and detailed analysis. Requires significant GPU memory."
+    },
+    {
+      "name": "xploiter/the-xploiter",
+      "description": "The Xploiter - Specialized model for security analysis and penetration testing scenarios. Useful for cybersecurity tasks and vulnerability assessment."
+    },
+    {
+      "name": "iunera/aura-xl",
+      "description": "Aura XL - Extended large model with enhanced creative writing and storytelling capabilities. Excellent for long-form content generation."
+    },
+    {
+      "name": "cypher-21/SentinalX",
+      "description": "SentinalX - Security-focused model designed for threat detection and analysis. Optimized for security operations and monitoring tasks."
+    },
+    {
+      "name": "jayeshpandit2480/gemma3-UNCENSORED:1b",
+      "description": "Gemma 3 Uncensored 1B - Lightweight uncensored model. Fast inference with minimal censorship filters. Good for quick responses on limited hardware."
+    },
+    {
+      "name": "jayeshpandit2480/gemma3-UNCENSORED:4b",
+      "description": "Gemma 3 Uncensored 4B - Medium-sized uncensored model. Balanced performance with reduced content filtering. Better quality than 1B variant."
+    },
+    {
+      "name": "jayeshpandit2480/granite4-UNCENSORED",
+      "description": "Granite 4 Uncensored - IBM-based architecture without content restrictions. Suitable for research and development where unfiltered responses are needed."
+    },
+    {
+      "name": "gurubot/girl",
+      "description": "Girl - Conversational AI with a specific personality focus. Designed for roleplay and character-based interactions."
+    },
+    {
+      "name": "qwen3:0.6b",
+      "description": "Qwen 3 0.6B - Ultra-lightweight model for resource-constrained environments. Perfect for edge devices and quick testing. Limited capabilities but very fast."
+    },
+    {
+      "name": "qwen3:1.7b",
+      "description": "Qwen 3 1.7B - Small but capable model. Good balance of speed and quality for basic tasks, chat, and simple coding assistance."
+    },
+    {
+      "name": "qwen3:4b",
+      "description": "Qwen 3 4B - Compact model with solid performance. Efficient for general chat, basic reasoning, and lightweight development tasks."
+    }
+  ]
+}
