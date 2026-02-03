@@ -75,6 +75,7 @@ class ConfigManager:
                     self.config.use_gpu = data.get('UseGPU', False)
                     self.config.network_access = data.get('NetworkAccess', False)
                     self.config.ollama_port = data.get('OllamaPort', 11434)
+                    self.config.max_concurrent_models = data.get('MaxConcurrentModels', 1)
                     # Load container_name if present, otherwise will use platform default
                     saved_container = data.get('ContainerName')
                     if saved_container:
@@ -90,7 +91,8 @@ class ConfigManager:
                     'UseGPU': self.config.use_gpu,
                     'NetworkAccess': self.config.network_access,
                     'OllamaPort': self.config.ollama_port,
-                    'ContainerName': self.config.container_name
+                    'ContainerName': self.config.container_name,
+                    'MaxConcurrentModels': self.config.max_concurrent_models
                 }, f, indent=4)
             return True
         except Exception as e:
@@ -260,6 +262,20 @@ class OllamaManager:
         ColorOutput.print(f"  Current port: {self.config_manager.config.ollama_port}", Colors.WHITE)
         
         print()
+        
+        # Current Max Concurrent Models setting
+        ColorOutput.print("CONCURRENT MODEL LIMIT:", Colors.CYAN, bold=True)
+        max_models = self.config_manager.config.max_concurrent_models
+        if max_models == 1:
+            ColorOutput.print(f"  Limit: {max_models} model (auto-unload enabled)", Colors.GREEN)
+            ColorOutput.print("  When loading a new model, the previous one will be automatically unloaded", Colors.GRAY)
+        elif max_models == 0:
+            ColorOutput.print("  Limit: Unlimited (all models stay loaded)", Colors.YELLOW)
+        else:
+            ColorOutput.print(f"  Limit: {max_models} models at once", Colors.GREEN)
+            ColorOutput.print(f"  When loading model #{max_models + 1}, the oldest will be unloaded", Colors.GRAY)
+        
+        print()
         ColorOutput.print("─" * 60, Colors.GRAY)
         print()
         
@@ -304,6 +320,9 @@ class OllamaManager:
         print()
         ColorOutput.print("Port Settings:", Colors.WHITE)
         print(f"  [5] Change Port (current: {self.config_manager.config.ollama_port})")
+        print()
+        ColorOutput.print("Model Memory Management:", Colors.WHITE)
+        print(f"  [6] Set Max Concurrent Models (current: {max_models if max_models > 0 else 'unlimited'})")
         print()
         print("  [0] Back to main menu")
         print()
@@ -515,6 +534,52 @@ class OllamaManager:
                                 ColorOutput.print("  Or run Settings again and choose 'y'", Colors.GRAY)
             except Exception as e:
                 ColorOutput.error(f"Error changing port: {e}")
+        
+        elif choice == '6':
+            print()
+            ColorOutput.print("SET MAX CONCURRENT MODELS", Colors.CYAN, bold=True)
+            print()
+            ColorOutput.print(f"Current limit: {self.config_manager.config.max_concurrent_models if self.config_manager.config.max_concurrent_models > 0 else 'unlimited'}", Colors.WHITE)
+            print()
+            ColorOutput.print("What this does:", Colors.YELLOW, bold=True)
+            print("  • Limits how many models can be loaded in memory at once")
+            print("  • When you load a new model and reach the limit, the oldest model is auto-unloaded")
+            print("  • Helps manage memory usage, especially useful with limited RAM/VRAM")
+            print()
+            ColorOutput.print("Recommended values:", Colors.GRAY)
+            print("  • 1 = One model at a time (auto-unload, good for low memory)")
+            print("  • 2-3 = Multiple models (if you have enough RAM/VRAM)")
+            print("  • 0 = Unlimited (keeps all models loaded, requires lots of memory)")
+            print()
+            
+            try:
+                new_limit = input("Enter max concurrent models (0 for unlimited): ").strip()
+                if not new_limit:
+                    ColorOutput.info("Setting change cancelled")
+                elif not new_limit.isdigit():
+                    ColorOutput.error("Invalid number")
+                else:
+                    limit_num = int(new_limit)
+                    if limit_num < 0 or limit_num > 20:
+                        ColorOutput.error("Limit must be between 0 and 20")
+                    else:
+                        old_limit = self.config_manager.config.max_concurrent_models
+                        self.config_manager.config.max_concurrent_models = limit_num
+                        self.config_manager.save_config()
+                        print()
+                        if limit_num == 0:
+                            ColorOutput.success(f"Concurrent model limit changed from {old_limit} to unlimited!")
+                            ColorOutput.print("  All loaded models will stay in memory until manually unloaded", Colors.GRAY)
+                        elif limit_num == 1:
+                            ColorOutput.success(f"Concurrent model limit set to {limit_num} model!")
+                            ColorOutput.print("  When loading a new model, the previous one will auto-unload", Colors.GREEN)
+                        else:
+                            ColorOutput.success(f"Concurrent model limit changed from {old_limit} to {limit_num} models!")
+                            ColorOutput.print(f"  When loading model #{limit_num + 1}, the oldest will auto-unload", Colors.GREEN)
+                        print()
+                        ColorOutput.info("This setting takes effect immediately for new model loads")
+            except Exception as e:
+                ColorOutput.error(f"Error changing limit: {e}")
         
         input("\nPress Enter to continue...")
     

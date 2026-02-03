@@ -46,6 +46,7 @@ class OllamaConfig:
     network_access: bool = False  # Allow network access (0.0.0.0) vs localhost only
     config_file: str = "ollama-config.json"
     models_dir: str = ""  # Will be set based on platform
+    max_concurrent_models: int = 1  # Maximum number of models to keep loaded in memory
 
 
 class PlatformDetector:

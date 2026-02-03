@@ -1315,6 +1315,31 @@ class DockerManager:
             return False
         
         try:
+            # Check if model is already loaded
+            loaded_models = self.get_loaded_models()
+            if any(m['name'] == model_name for m in loaded_models):
+                ColorOutput.info(f"Model {model_name} is already loaded in memory")
+                return True
+            
+            # Check concurrent model limit
+            max_concurrent = self.config.max_concurrent_models
+            if max_concurrent > 0 and len(loaded_models) >= max_concurrent:
+                # Need to unload the oldest model(s) to make room
+                models_to_unload = len(loaded_models) - max_concurrent + 1
+                
+                ColorOutput.warning(f"Concurrent model limit ({max_concurrent}) reached")
+                ColorOutput.info(f"Auto-unloading {models_to_unload} oldest model(s)...")
+                print()
+                
+                # Unload the oldest models
+                for i in range(models_to_unload):
+                    if i < len(loaded_models):
+                        old_model = loaded_models[i]
+                        ColorOutput.print(f"  Unloading: {old_model['name']}", Colors.GRAY)
+                        self.unload_model(old_model['name'], force=False)
+                
+                print()
+            
             ColorOutput.info(f"Loading model into memory: {model_name}")
             ColorOutput.print("This may take a moment depending on model size...", Colors.GRAY)
             
@@ -1330,6 +1355,10 @@ class DockerManager:
             if result.returncode == 0:
                 ColorOutput.success(f"Model {model_name} has been loaded into memory")
                 ColorOutput.print("  Model will stay loaded for 5 minutes of inactivity", Colors.GRAY)
+                if max_concurrent == 1:
+                    ColorOutput.print("  (Auto-unload is enabled - new models will replace this one)", Colors.CYAN)
+                elif max_concurrent > 1:
+                    ColorOutput.print(f"  (Up to {max_concurrent} models can be loaded at once)", Colors.CYAN)
                 return True
             else:
                 ColorOutput.error(f"Failed to load model: {result.stderr}")
