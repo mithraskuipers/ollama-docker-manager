@@ -268,9 +268,13 @@ class PlatformDetector:
             'gpu_detected': False,
             'driver_installed': False,
             'docker_support': False,
+            'daemon_configured': False,
             'issues': [],
             'recommendations': []
         }
+        
+        plat = PlatformDetector.get_platform()
+        is_wsl = (plat == Platform.WSL)
         
         # Check 1: nvidia-smi exists and works
         try:
@@ -284,39 +288,126 @@ class PlatformDetector:
                 result['driver_installed'] = True
             else:
                 result['issues'].append('NVIDIA driver not working')
-                result['recommendations'].append('Install NVIDIA drivers:')
-                result['recommendations'].append('  Ubuntu/Debian: sudo apt install nvidia-driver-XXX')
-                result['recommendations'].append('  Or use: ubuntu-drivers devices && sudo ubuntu-drivers autoinstall')
+                if is_wsl:
+                    result['recommendations'].append('🔧 WSL GPU Setup:')
+                    result['recommendations'].append('  1. Install NVIDIA drivers in Windows (not WSL)')
+                    result['recommendations'].append('     Visit: https://www.nvidia.com/download/index.aspx')
+                    result['recommendations'].append('  2. In Windows PowerShell: wsl --shutdown')
+                    result['recommendations'].append('  3. Restart WSL and test: nvidia-smi')
+                else:
+                    result['recommendations'].append('Install NVIDIA drivers:')
+                    result['recommendations'].append('  Ubuntu/Debian: sudo apt install nvidia-driver-535')
+                    result['recommendations'].append('  Or use: ubuntu-drivers devices && sudo ubuntu-drivers autoinstall')
                 return result
         except FileNotFoundError:
             result['issues'].append('nvidia-smi not found')
-            result['recommendations'].append('Install NVIDIA drivers first')
+            if is_wsl:
+                result['recommendations'].append('Install NVIDIA drivers in Windows first')
+                result['recommendations'].append('  Visit: https://www.nvidia.com/download/index.aspx')
+            else:
+                result['recommendations'].append('Install NVIDIA drivers first')
             return result
         
-        # Check 2: nvidia-docker / nvidia-container-toolkit
+        # Check 2: Docker daemon configuration for NVIDIA runtime
+        daemon_config_path = '/etc/docker/daemon.json'
         try:
+            import json
+            daemon_configured = False
+            
+            if os.path.exists(daemon_config_path):
+                with open(daemon_config_path, 'r') as f:
+                    daemon_config = json.load(f)
+                    # Check if nvidia runtime is configured
+                    if daemon_config.get('default-runtime') == 'nvidia' or \
+                       'nvidia' in daemon_config.get('runtimes', {}):
+                        daemon_configured = True
+                        result['daemon_configured'] = True
+            
+            if not daemon_configured:
+                result['issues'].append('Docker daemon not configured for NVIDIA runtime')
+        except Exception:
+            result['issues'].append('Could not verify Docker daemon configuration')
+        
+        # Check 3: nvidia-container-toolkit and Docker GPU support
+        try:
+            # First check if nvidia-container-runtime is installed
+            runtime_check = subprocess.run(
+                ['which', 'nvidia-container-runtime'],
+                capture_output=True, timeout=5
+            )
+            
+            if runtime_check.returncode != 0:
+                result['issues'].append('nvidia-container-toolkit not installed')
+                result['recommendations'].append('')
+                result['recommendations'].append('📦 Install NVIDIA Container Toolkit:')
+                result['recommendations'].append('  1. Setup repository:')
+                result['recommendations'].append('     curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg')
+                result['recommendations'].append('     curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \\')
+                result['recommendations'].append('       sed "s#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g" | \\')
+                result['recommendations'].append('       sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list')
+                result['recommendations'].append('  2. Install:')
+                result['recommendations'].append('     sudo apt-get update')
+                result['recommendations'].append('     sudo apt-get install -y nvidia-container-toolkit')
+                result['recommendations'].append('  3. Configure Docker daemon:')
+                result['recommendations'].append('     sudo nvidia-ctk runtime configure --runtime=docker')
+                result['recommendations'].append('  4. CRITICAL - Restart Docker:')
+                result['recommendations'].append('     sudo systemctl restart docker')
+                if is_wsl:
+                    result['recommendations'].append('     Or: sudo service docker restart')
+                result['recommendations'].append('')
+                result['recommendations'].append('  5. Verify GPU access:')
+                result['recommendations'].append('     docker run --rm --gpus all nvidia/cuda:11.8.0-base-ubuntu22.04 nvidia-smi')
+                return result
+            
+            # Now test actual Docker GPU support
             docker_check = subprocess.run(
-                ['docker', 'run', '--rm', '--gpus', 'all', 'nvidia/cuda:11.0-base', 'nvidia-smi'],
-                capture_output=True, timeout=10
+                ['docker', 'run', '--rm', '--gpus', 'all', 'nvidia/cuda:11.8.0-base-ubuntu22.04', 'nvidia-smi'],
+                capture_output=True, timeout=15
             )
             
             if docker_check.returncode == 0:
                 result['docker_support'] = True
                 result['available'] = True
             else:
-                result['issues'].append('Docker GPU support not configured')
-                result['recommendations'].append('Install NVIDIA Container Toolkit:')
-                result['recommendations'].append('  1. Add repository:')
-                result['recommendations'].append('     distribution=$(. /etc/os-release;echo $ID$VERSION_ID)')
-                result['recommendations'].append('     curl -s -L https://nvidia.github.io/nvidia-docker/gpgkey | sudo apt-key add -')
-                result['recommendations'].append('     curl -s -L https://nvidia.github.io/nvidia-docker/$distribution/nvidia-docker.list | sudo tee /etc/apt/sources.list.d/nvidia-docker.list')
-                result['recommendations'].append('  2. Install:')
-                result['recommendations'].append('     sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit')
-                result['recommendations'].append('  3. Restart Docker:')
-                result['recommendations'].append('     sudo systemctl restart docker')
-        except Exception:
-            result['issues'].append('Could not test Docker GPU support')
-            result['recommendations'].append('Ensure nvidia-container-toolkit is installed')
+                # Container toolkit is installed but not working
+                error_msg = docker_check.stderr.decode('utf-8', errors='ignore').lower()
+                
+                if 'could not select device driver' in error_msg or 'unknown runtime' in error_msg or 'nvidia' in error_msg:
+                    result['issues'].append('Docker daemon not configured for NVIDIA runtime')
+                    result['recommendations'].append('')
+                    result['recommendations'].append('🔧 Configure Docker for GPU (CRITICAL STEPS):')
+                    result['recommendations'].append('  1. Create/edit /etc/docker/daemon.json with this content:')
+                    result['recommendations'].append('     {')
+                    result['recommendations'].append('       "default-runtime": "nvidia",')
+                    result['recommendations'].append('       "runtimes": {')
+                    result['recommendations'].append('         "nvidia": {')
+                    result['recommendations'].append('           "path": "nvidia-container-runtime",')
+                    result['recommendations'].append('           "runtimeArgs": []')
+                    result['recommendations'].append('         }')
+                    result['recommendations'].append('       }')
+                    result['recommendations'].append('     }')
+                    result['recommendations'].append('')
+                    result['recommendations'].append('  2. CRITICAL - Restart Docker daemon:')
+                    result['recommendations'].append('     sudo systemctl restart docker')
+                    if is_wsl:
+                        result['recommendations'].append('     Or: sudo service docker restart')
+                        result['recommendations'].append('     Or in Windows PowerShell: wsl --shutdown (then restart WSL)')
+                    result['recommendations'].append('')
+                    result['recommendations'].append('  3. Verify Docker sees NVIDIA runtime:')
+                    result['recommendations'].append('     docker info | grep -i runtime')
+                    result['recommendations'].append('')
+                    result['recommendations'].append('  4. Test GPU access:')
+                    result['recommendations'].append('     docker run --rm --gpus all nvidia/cuda:11.8.0-base-ubuntu22.04 nvidia-smi')
+                else:
+                    result['issues'].append('Docker GPU test failed')
+                    result['recommendations'].append('Ensure nvidia-container-toolkit is properly installed and Docker is restarted')
+                    result['recommendations'].append('  sudo systemctl restart docker')
+                    if is_wsl:
+                        result['recommendations'].append('  Or: sudo service docker restart')
+                
+        except Exception as e:
+            result['issues'].append(f'Could not test Docker GPU support: {e}')
+            result['recommendations'].append('Ensure nvidia-container-toolkit is installed and Docker is restarted')
         
         return result
 
