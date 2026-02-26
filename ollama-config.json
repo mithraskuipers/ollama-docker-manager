@@ -1,0 +1,6 @@
+{
+    "UseGPU": false,
+    "NetworkAccess": true,
+    "OllamaPort": 11434,
+    "ContainerName": "ollama-linux"
+}
