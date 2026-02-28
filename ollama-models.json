@@ -55,6 +55,10 @@
     {
       "name": "qwen3:4b",
       "description": "Qwen 3 4B - Compact model with solid performance. Efficient for general chat, basic reasoning, and lightweight development tasks."
+    },
+    {
+      "name": "qwen3-vl:2b",
+      "description": "Vision"
     }
   ]
 }
