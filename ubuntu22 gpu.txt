@@ -1,0 +1,26 @@
+# 1. First, verify your daemon.json is correct
+cat /etc/docker/daemon.json
+# 2. Restart Docker daemon (critical step!)
+sudo systemctl restart docker
+# Or if systemctl doesn't work in WSL:
+sudo service docker restart
+# 3. Verify Docker sees NVIDIA runtime
+docker info | grep -i runtime
+# 4. Test GPU access
+docker run --rm --gpus all nvidia/cuda:11.8.0-base-ubuntu22.04 nvidia-smi
+/etc/docker/daemon.json
+{
+  "default-runtime": "nvidia",
+  "runtimes": {
+    "nvidia": {
+      "path": "nvidia-container-runtime",
+      "runtimeArgs": []
+    }
+  }
+}
+echo "GPU in WSL:" && nvidia-smi
+echo -e "\nDocker daemon.json:" && cat /etc/docker/daemon.json
+echo -e "\nDocker runtimes:" && docker info | grep -i runtime
+echo -e "\nGPU Test:" && docker run --rm --gpus all nvidia/cuda:11.8.0-base-ubuntu22.04 nvidia-smi
+wsl --shutdown
+docker info | grep -i "default runtime"

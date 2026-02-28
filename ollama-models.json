@@ -1,6 +1,18 @@
 {
   "models": [
     {
+      "name": "phi3:3.8b",
+      "description": ""
+    },
+    {
+      "name": "mistral-small3.2",
+      "description": ""
+    },
+    {
+      "name": "smollm2:1.7b",
+      "description": ""
+    },
+    {
       "name": "qwen3:14b",
       "description": "Qwen 3 14B - Large multilingual model with strong reasoning capabilities. Good for complex tasks, coding, and detailed analysis. Requires significant GPU memory."
     },
