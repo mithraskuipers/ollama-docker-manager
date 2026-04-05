@@ -22,7 +22,7 @@ from typing import List, Optional
 
 # Import from our modules
 from utils import (
-    Platform, Colors, OllamaConfig, PlatformDetector, ColorOutput
+    Platform, Colors, OllamaConfig, PlatformDetector, ColorOutput, VenvManager
 )
 from docker_manager import DockerManager
 from turboquant_manager import TurboQuantManager
@@ -117,53 +117,95 @@ class OllamaManager:
         ColorOutput.print("       🦙 OLLAMA DOCKER MANAGER - Cross Platform", Colors.CYAN, bold=True)
         ColorOutput.print("=" * 60, Colors.CYAN, bold=True)
         print()
-        
+
         # Platform info
         ColorOutput.print(f"Platform: {self.platform.value}", Colors.GRAY)
-        ColorOutput.print(f"Container Name: {self.config_manager.config.container_name}", Colors.GRAY)
-        ColorOutput.print(f"Models Directory: {self.config_manager.config.models_dir}", Colors.GRAY)
-        ColorOutput.print(f"Port: {self.config_manager.config.ollama_port}", Colors.GRAY)
+        ColorOutput.print(f"Container: {self.config_manager.config.container_name}  |  Port: {self.config_manager.config.ollama_port}", Colors.GRAY)
         print()
-        
-        # Status
-        if self.docker.container_running():
-            ColorOutput.print("Status: RUNNING", Colors.GREEN, bold=True)
-        elif self.docker.container_exists():
-            ColorOutput.print("Status: STOPPED", Colors.YELLOW, bold=True)
+
+        # ── Status block with next-step hint ──────────────────────────────────
+        image_ok    = self.docker.image_exists()
+        running     = self.docker.container_running()
+        stopped     = self.docker.container_exists() and not running
+
+        if running:
+            ColorOutput.print("● Ollama is RUNNING", Colors.GREEN, bold=True)
+        elif stopped:
+            ColorOutput.print("● Ollama is STOPPED  →  press [3] to start", Colors.YELLOW, bold=True)
+        elif image_ok:
+            ColorOutput.print("● Ollama image installed  →  press [2] to install a model, then [3] to start", Colors.YELLOW, bold=True)
         else:
-            ColorOutput.print("Status: NOT INSTALLED", Colors.GRAY, bold=True)
-        
+            ColorOutput.print("● Ollama is NOT installed  →  start at step 1 below", Colors.GRAY, bold=True)
+
         print()
         ColorOutput.print("─" * 60, Colors.GRAY)
         print()
-        
-        # Menu options
-        ColorOutput.print("INSTALLATION:", Colors.CYAN, bold=True)
-        print("  [I] Install Ollama (download image)")
+
+        # ── STEP 1 ────────────────────────────────────────────────────────────
+        if image_ok:
+            step1_label = "✔ Ollama installed"
+            step1_color = Colors.GREEN
+        else:
+            step1_label = "Ollama NOT installed  ← START HERE"
+            step1_color = Colors.YELLOW
+
+        ColorOutput.print(f"  STEP 1 — INSTALL OLLAMA  ({step1_label})", step1_color, bold=True)
+        print("    [1] Install Ollama  (download Docker image, ~1-2 GB)")
         print()
-        
-        ColorOutput.print("MODEL MANAGEMENT:", Colors.CYAN, bold=True)
-        print("  [1] Install Model")
-        print("  [2] Uninstall Model")
-        print("  [3] List Installed Models")
-        print("  [L] Load Model into Memory")
-        print("  [U] Unload Models from Memory")
+
+        # ── STEP 2 ────────────────────────────────────────────────────────────
+        # Try to count installed models (needs container running; show hint otherwise)
+        model_count = None
+        if running:
+            try:
+                models = self.docker.list_models()
+                model_count = max(0, len(models) - 1)   # subtract header line
+            except Exception:
+                pass
+
+        if model_count is not None and model_count > 0:
+            step2_label = f"{model_count} model(s) installed"
+            step2_color = Colors.GREEN
+        elif not image_ok:
+            step2_label = "complete step 1 first"
+            step2_color = Colors.GRAY
+        else:
+            step2_label = "no models installed  ← DO THIS NEXT"
+            step2_color = Colors.YELLOW
+
+        ColorOutput.print(f"  STEP 2 — INSTALL A MODEL  ({step2_label})", step2_color, bold=True)
+        print("    [2] Install Model         (pick from list or enter a name)")
+        print("    [D] Uninstall Model")
+        print("    [M] List Installed Models")
         print()
-        
-        ColorOutput.print("CONTAINER:", Colors.CYAN, bold=True)
-        print("  [4] Start Ollama")
-        print("  [5] Stop Ollama")
-        print("  [6] View Status")
-        print("  [R] Recreate Container (keeps models)")
+
+        # ── STEP 3 ────────────────────────────────────────────────────────────
+        if running:
+            step3_label = "RUNNING"
+            step3_color = Colors.GREEN
+        elif not image_ok:
+            step3_label = "complete steps 1 & 2 first"
+            step3_color = Colors.GRAY
+        else:
+            step3_label = "ready to start"
+            step3_color = Colors.CYAN
+
+        ColorOutput.print(f"  STEP 3 — START / STOP OLLAMA  ({step3_label})", step3_color, bold=True)
+        print("    [3] Start Ollama")
+        print("    [4] Stop  Ollama")
+        print("    [5] View Status")
         print()
-        
-        ColorOutput.print("USAGE:", Colors.CYAN, bold=True)
-        print("  [7] Chat with Model")
-        print("  [8] API Info & Network Access")
+
+        # ── USE ───────────────────────────────────────────────────────────────
+        ColorOutput.print("  USE", Colors.CYAN, bold=True)
+        print("    [6] Chat with Model")
+        print("    [7] API Info & Network Access")
+        print("    [L] Load Model into Memory")
+        print("    [U] Unload Models from Memory")
         print()
-        
-        ColorOutput.print("TURBOQUANT (GPU Quantized Inference):", Colors.MAGENTA, bold=True)
-        tq_running = self.turboquant.is_server_running()
+
+        # ── TURBOQUANT ────────────────────────────────────────────────────────
+        tq_running   = self.turboquant.is_server_running()
         tq_installed = self.turboquant.is_turboquant_installed()
         if tq_running:
             tq_status = f"{Colors.GREEN}RUNNING{Colors.RESET} — port {self.turboquant.config.get('port', 8000)}"
@@ -171,16 +213,19 @@ class OllamaManager:
             tq_status = f"{Colors.YELLOW}installed / stopped{Colors.RESET}"
         else:
             tq_status = f"{Colors.GRAY}not installed{Colors.RESET}"
-        print(f"  [T] TurboQuant Server Manager  ({tq_status})")
+        ColorOutput.print("  TURBOQUANT  (GPU Quantized Inference)", Colors.MAGENTA, bold=True)
+        print(f"    [T] TurboQuant Server Manager  ({tq_status})")
         print()
-        
-        ColorOutput.print("ADVANCED:", Colors.CYAN, bold=True)
-        print("  [S] Settings (GPU/CPU, Network, Port)")
-        print("  [9] Remove Container & Image (keeps models)")
-        print("  [X] Full Uninstall (deletes EVERYTHING including models)")
+
+        # ── ADVANCED ──────────────────────────────────────────────────────────
+        ColorOutput.print("  ADVANCED", Colors.CYAN, bold=True)
+        print("    [S] Settings (GPU/CPU, Network, Port)")
+        print("    [R] Recreate Container  (keeps models)")
+        print("    [9] Remove Container & Image  (keeps models)")
+        print("    [X] Full Uninstall  (deletes EVERYTHING including models)")
         print()
-        
-        print("  [0] Exit")
+
+        print("    [0] Exit")
         print()
         ColorOutput.print("─" * 60, Colors.GRAY)
         print()
@@ -242,8 +287,6 @@ class OllamaManager:
             ColorOutput.print("  • New DNS settings active (8.8.8.8, 8.8.4.4, 1.1.1.1)", Colors.GREEN)
             ColorOutput.print("  • Model downloads should now work!", Colors.GREEN)
             ColorOutput.print(f"  • Your models are preserved in: {models_dir}", Colors.CYAN)
-            print()
-            ColorOutput.print("💡 Try installing a model again now!", Colors.YELLOW)
             return True
         else:
             ColorOutput.error("Failed to create new container")
@@ -956,7 +999,7 @@ class OllamaManager:
             
             if not self.docker.container_exists():
                 print()
-                ColorOutput.info("Next step: Press [4] to start Ollama and create the container")
+                ColorOutput.info("Next step: press [2] to install a model, then [3] to start Ollama")
         else:
             ColorOutput.info("This will download the Ollama Docker image")
             ColorOutput.print("  Estimated size: ~1-2 GB", Colors.GRAY)
@@ -967,7 +1010,7 @@ class OllamaManager:
                 if self.docker.pull_image_with_progress():
                     print()
                     ColorOutput.success("Ollama installed successfully!")
-                    ColorOutput.info("Next step: Press [4] to start Ollama")
+                    ColorOutput.info("Next step: press [2] to install a model, then [3] to start Ollama")
         
         input("\nPress Enter to continue...")
     
@@ -1120,20 +1163,19 @@ class OllamaManager:
         
         input("\nPress Enter to continue...")
     
-    # Path to the dedicated TurboQuant venv — isolated from the rest of the project
-    TURBOQUANT_VENV = str(Path.home() / ".turboquant-venv")
+    # Shared venv path — all pip installs (turboquant, requests, etc.) go here
+    TURBOQUANT_VENV = VenvManager.venv_dir()
 
     def _install_turboquant(self) -> bool:
         """
-        Install turboquant into a dedicated venv at ~/.turboquant-venv.
+        Install turboquant into the shared project venv (~/.ollama-manager-venv).
         Uses a venv to avoid the PEP 668 externally-managed-environment error
         on modern Debian/Ubuntu systems.  Completely isolated from the rest
         of this project and from the system Python.
         Returns True if installation succeeded.
         """
-        venv_path = Path(self.TURBOQUANT_VENV)
-        venv_python = str(venv_path / "bin" / "python")
-        venv_pip    = str(venv_path / "bin" / "pip")
+        venv_python = VenvManager.python()
+        venv_pip    = VenvManager.pip()
 
         print()
         ColorOutput.print("=" * 65, Colors.MAGENTA, bold=True)
@@ -1141,58 +1183,35 @@ class OllamaManager:
         ColorOutput.print("=" * 65, Colors.MAGENTA, bold=True)
         print()
         ColorOutput.print(
-            f"  Venv location: {self.TURBOQUANT_VENV}", Colors.GRAY
+            f"  Shared venv: {VenvManager.venv_dir()}", Colors.GRAY
         )
         ColorOutput.print(
             "  (Isolated from system Python and the rest of this project)", Colors.GRAY
         )
         print()
 
-        steps = [
-            (
-                "Installing python3-pip and python3-venv (system packages)",
-                "sudo apt install -y python3-pip python3-venv python3-full",
-            ),
-            (
-                f"Creating dedicated TurboQuant venv at {self.TURBOQUANT_VENV}",
-                f"{sys.executable} -m venv {self.TURBOQUANT_VENV}",
-            ),
-            (
-                "Upgrading pip inside venv",
-                f"{venv_pip} install --upgrade pip",
-            ),
-            (
-                "Installing turboquant inside venv",
-                f"{venv_pip} install turboquant",
-            ),
-        ]
+        # Step 1 — ensure shared venv exists (creates it if missing)
+        ColorOutput.print("  Step 1/2: Ensuring shared venv exists", Colors.MAGENTA)
+        ColorOutput.print(f"  Venv: {VenvManager.venv_dir()}", Colors.GRAY)
+        print()
+        if not VenvManager.ensure(verbose=True):
+            ColorOutput.error("Could not create shared venv.")
+            ColorOutput.print("  Tip: make sure you have internet access and sudo rights.", Colors.YELLOW)
+            return False
+        ColorOutput.success("Step 1 done.")
+        print()
 
-        for i, (label, cmd) in enumerate(steps, 1):
-            ColorOutput.print(f"  Step {i}/{len(steps)}: {label}", Colors.MAGENTA)
-            ColorOutput.print(f"  $ {cmd}", Colors.GRAY)
-            print()
-            try:
-                result = subprocess.run(cmd, shell=True, timeout=180)
-                if result.returncode != 0:
-                    print()
-                    ColorOutput.error(f"Step {i} failed (exit code {result.returncode})")
-                    if i == 1:
-                        ColorOutput.print(
-                            "  Tip: make sure you have internet access and sudo rights.", Colors.YELLOW
-                        )
-                    return False
-                else:
-                    ColorOutput.success(f"Step {i} done.")
-                    print()
-            except subprocess.TimeoutExpired:
-                ColorOutput.error(f"Step {i} timed out.")
-                return False
-            except Exception as e:
-                ColorOutput.error(f"Step {i} error: {e}")
-                return False
+        # Step 2 — install turboquant into the shared venv
+        ColorOutput.print("  Step 2/2: Installing turboquant into shared venv", Colors.MAGENTA)
+        ColorOutput.print(f"  $ {VenvManager.pip()} install turboquant", Colors.GRAY)
+        print()
+        if not VenvManager.install("turboquant", verbose=True):
+            return False
+        ColorOutput.success("Step 2 done.")
+        print()
 
-        # Store the venv python path so TurboQuantManager uses it
-        self.turboquant.venv_python = venv_python
+        # Sync venv python path into TurboQuantManager
+        self.turboquant.venv_python = VenvManager.python()
 
         print()
         ColorOutput.print("=" * 65, Colors.GREEN, bold=True)
@@ -1379,7 +1398,8 @@ class OllamaManager:
             ColorOutput.print("  ✅  requests lib    — available", Colors.GREEN)
         else:
             ColorOutput.print("  ⚠️   requests lib    — missing (needed for chat feature)", Colors.YELLOW)
-            ColorOutput.print("      Install: pip install requests --user", Colors.GRAY)
+            ColorOutput.print("      Auto-installed into shared venv on next startup, or run:", Colors.GRAY)
+            ColorOutput.print(f"      {VenvManager.pip()} install requests", Colors.GRAY)
 
         print()
 
@@ -1563,10 +1583,8 @@ class OllamaManager:
                 "  Would you like to install TurboQuant automatically?", Colors.CYAN
             )
             print("  This will run:")
-            ColorOutput.print("    pip install turboquant --user", Colors.GRAY)
-            ColorOutput.print(
-                "    echo 'export PATH=$HOME/.local/bin:$PATH' >> ~/.bashrc", Colors.GRAY
-            )
+            ColorOutput.print(f"    {VenvManager.pip()} install turboquant", Colors.GRAY)
+            ColorOutput.print(f"    (venv: {VenvManager.venv_dir()})", Colors.GRAY)
             print()
             ans = input("  Install now? (y/n): ").strip().lower()
             if ans == "y":
@@ -1681,37 +1699,43 @@ class OllamaManager:
                 self.show_main_menu()
                 choice = input("Select an option: ").strip().upper()
                 
-                if choice == 'I':
+                # Step 1
+                if choice == '1':
                     self.install_ollama()
-                elif choice == '1':
-                    self.install_model_menu()
+                # Step 2 — model management
                 elif choice == '2':
+                    self.install_model_menu()
+                elif choice == 'D':
                     self.uninstall_model_menu()
-                elif choice == '3':
+                elif choice == 'M':
                     self.list_models()
+                # Step 3 — start / stop
+                elif choice == '3':
+                    self.docker.start_container()
+                    input("\nPress Enter to continue...")
+                elif choice == '4':
+                    self.docker.stop_container()
+                    input("\nPress Enter to continue...")
+                elif choice == '5':
+                    self.view_status()
+                # Use
+                elif choice == '6':
+                    self.chat_menu()
+                elif choice == '7':
+                    self.show_api_info()
                 elif choice == 'L':
                     self.load_models_menu()
                 elif choice == 'U':
                     self.unload_models_menu()
-                elif choice == '4':
-                    self.docker.start_container()
-                    input("\nPress Enter to continue...")
-                elif choice == '5':
-                    self.docker.stop_container()
-                    input("\nPress Enter to continue...")
-                elif choice == '6':
-                    self.view_status()
+                # TurboQuant
+                elif choice == 'T':
+                    self.turboquant.show_menu()
+                # Advanced
+                elif choice == 'S':
+                    self.handle_settings()
                 elif choice == 'R':
                     self.recreate_container()
                     input("\nPress Enter to continue...")
-                elif choice == '7':
-                    self.chat_menu()
-                elif choice == '8':
-                    self.show_api_info()
-                elif choice == 'T':
-                    self.turboquant.show_menu()
-                elif choice == 'S':
-                    self.handle_settings()
                 elif choice == '9':
                     self.docker.complete_removal()
                     input("\nPress Enter to continue...")

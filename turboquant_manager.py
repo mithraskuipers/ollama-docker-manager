@@ -21,7 +21,7 @@ import signal
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 
-from utils import Colors, ColorOutput, PlatformDetector, Platform
+from utils import Colors, ColorOutput, PlatformDetector, Platform, VenvManager
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -75,8 +75,7 @@ TURBOQUANT_SUGGESTED_MODELS: List[Dict] = [
 
 TURBOQUANT_CONFIG_FILE = "turboquant-config.json"
 
-# Dedicated venv for TurboQuant — same path as used by OllamaManager installer
-TURBOQUANT_VENV = str(Path.home() / ".turboquant-venv")
+# Shared venv — single source of truth is VenvManager in utils.py
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -117,11 +116,10 @@ class TurboQuantManager:
 
     def _detect_venv_python(self) -> str:
         """
-        Return the venv python if ~/.turboquant-venv exists and works,
-        otherwise fall back to the system python3/python.
+        Return the shared venv Python if available, else fall back to system python.
         """
-        venv_py = str(Path(TURBOQUANT_VENV) / "bin" / "python")
-        if Path(venv_py).exists():
+        if VenvManager.exists():
+            venv_py = VenvManager.python()
             try:
                 r = subprocess.run([venv_py, "--version"], capture_output=True, timeout=5)
                 if r.returncode == 0:
@@ -164,19 +162,10 @@ class TurboQuantManager:
         return "python3"
 
     def is_turboquant_installed(self) -> bool:
-        """Check if turboquant is installed — checks venv first, then system pip."""
-        # Check venv first
-        venv_py = str(Path(TURBOQUANT_VENV) / "bin" / "python")
-        if Path(venv_py).exists():
-            try:
-                r = subprocess.run(
-                    [venv_py, "-m", "pip", "show", "turboquant"],
-                    capture_output=True, text=True, timeout=10
-                )
-                if r.returncode == 0:
-                    return True
-            except Exception:
-                pass
+        """Check if turboquant is installed in the shared venv (or system pip as fallback)."""
+        # Check shared venv first
+        if VenvManager.is_installed("turboquant"):
+            return True
         # Fallback: check system python
         try:
             r = subprocess.run(
@@ -188,34 +177,17 @@ class TurboQuantManager:
             return False
 
     def install_turboquant(self) -> bool:
-        """pip-install turboquant and fix PATH if needed."""
-        ColorOutput.info("Installing turboquant via pip...")
+        """Install turboquant into the shared venv (creates venv first if needed)."""
+        ColorOutput.info(f"Installing turboquant into shared venv: {VenvManager.venv_dir()}")
         print()
-        py = self._python_cmd()
-        try:
-            proc = subprocess.run(
-                [py, "-m", "pip", "install", "turboquant", "--user"],
-                timeout=120
-            )
-            if proc.returncode != 0:
-                ColorOutput.error("pip install failed.")
-                return False
-        except subprocess.TimeoutExpired:
-            ColorOutput.error("Installation timed out.")
+        if not VenvManager.ensure(verbose=True):
+            ColorOutput.error("Could not create shared venv.")
             return False
-        except Exception as e:
-            ColorOutput.error(f"Installation error: {e}")
+        if not VenvManager.install("turboquant", verbose=True):
             return False
-
-        # Ensure ~/.local/bin is on PATH for this session
-        local_bin = str(Path.home() / ".local" / "bin")
-        if local_bin not in os.environ.get("PATH", ""):
-            os.environ["PATH"] = local_bin + os.pathsep + os.environ.get("PATH", "")
-
-        ColorOutput.success("turboquant installed!")
-        print()
-        ColorOutput.info("To make the PATH change permanent, add this to ~/.bashrc:")
-        ColorOutput.print(f"  export PATH=$HOME/.local/bin:$PATH", Colors.CYAN)
+        # Update this instance to use the venv python
+        self.venv_python = VenvManager.python()
+        ColorOutput.success("turboquant installed into shared venv!")
         return True
 
     def _check_server_health(self, port: int, timeout: int = 30) -> bool:

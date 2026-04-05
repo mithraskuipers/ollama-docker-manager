@@ -459,3 +459,144 @@ class CommandResult:
     returncode: int
     stdout: str
     stderr: str
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Shared venv manager
+# Single source of truth for the project-wide virtual environment.
+# All pip installs (turboquant, requests, etc.) go here so there is
+# never a conflict with the system Python or with each other.
+# ──────────────────────────────────────────────────────────────────────────────
+
+import sys as _sys
+
+SHARED_VENV_DIR = str(Path.home() / ".ollama-manager-venv")
+
+
+class VenvManager:
+    """
+    Manages a single shared virtual environment for the entire project.
+
+    Venv location : ~/.ollama-manager-venv
+    Completely isolated from system Python and from Docker/Ollama.
+
+    Usage
+    -----
+    python  = VenvManager.python()   # path to venv python binary
+    pip     = VenvManager.pip()      # path to venv pip binary
+    ok      = VenvManager.ensure()   # create venv if missing, return True on success
+    ok      = VenvManager.install("turboquant")   # ensure venv + pip install
+    present = VenvManager.is_installed("requests") # check if pkg is in venv
+    """
+
+    @staticmethod
+    def venv_dir() -> Path:
+        return Path(SHARED_VENV_DIR)
+
+    @staticmethod
+    def python() -> str:
+        """Absolute path to the venv Python binary."""
+        return str(VenvManager.venv_dir() / "bin" / "python")
+
+    @staticmethod
+    def pip() -> str:
+        """Absolute path to the venv pip binary."""
+        return str(VenvManager.venv_dir() / "bin" / "pip")
+
+    @staticmethod
+    def exists() -> bool:
+        """Return True if the venv has already been created."""
+        return Path(VenvManager.python()).exists()
+
+    @staticmethod
+    def ensure(verbose: bool = True) -> bool:
+        """
+        Create the shared venv if it does not already exist.
+        Also installs/upgrades pip inside the venv.
+        Returns True on success.
+        """
+        if VenvManager.exists():
+            return True
+
+        if verbose:
+            ColorOutput.info(f"Creating shared venv at {SHARED_VENV_DIR} ...")
+
+        # Step 1 — make sure python3-venv is available on the system
+        apt_ok = subprocess.run(
+            "sudo apt install -y python3-pip python3-venv python3-full",
+            shell=True, timeout=120
+        )
+        # Non-fatal — venv module may already be present even if apt fails
+
+        # Step 2 — create the venv
+        try:
+            result = subprocess.run(
+                [_sys.executable, "-m", "venv", str(VenvManager.venv_dir())],
+                timeout=60
+            )
+            if result.returncode != 0:
+                if verbose:
+                    ColorOutput.error("Failed to create venv.")
+                return False
+        except Exception as e:
+            if verbose:
+                ColorOutput.error(f"venv creation error: {e}")
+            return False
+
+        # Step 3 — upgrade pip inside the new venv
+        try:
+            subprocess.run(
+                [VenvManager.pip(), "install", "--upgrade", "pip"],
+                timeout=60
+            )
+        except Exception:
+            pass  # Non-fatal
+
+        if verbose:
+            ColorOutput.success(f"Shared venv ready: {SHARED_VENV_DIR}")
+        return True
+
+    @staticmethod
+    def is_installed(package: str) -> bool:
+        """Return True if *package* is installed inside the shared venv."""
+        if not VenvManager.exists():
+            return False
+        try:
+            r = subprocess.run(
+                [VenvManager.pip(), "show", package],
+                capture_output=True, text=True, timeout=15
+            )
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    @staticmethod
+    def install(package: str, verbose: bool = True) -> bool:
+        """
+        Ensure the shared venv exists, then pip-install *package* into it.
+        Returns True on success.
+        """
+        if not VenvManager.ensure(verbose=verbose):
+            return False
+        if verbose:
+            ColorOutput.info(f"Installing {package} into shared venv...")
+        try:
+            result = subprocess.run(
+                [VenvManager.pip(), "install", package],
+                timeout=180
+            )
+            if result.returncode != 0:
+                if verbose:
+                    ColorOutput.error(f"Failed to install {package}.")
+                return False
+        except subprocess.TimeoutExpired:
+            if verbose:
+                ColorOutput.error(f"Installation of {package} timed out.")
+            return False
+        except Exception as e:
+            if verbose:
+                ColorOutput.error(f"Installation error: {e}")
+            return False
+        if verbose:
+            ColorOutput.success(f"{package} installed.")
+        return True
