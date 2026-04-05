@@ -1,0 +1,6 @@
+# When you COPY the ollama-docker-manager dir to the WSL environment
+
+sudo apt update -y ;
+sudo apt install dos2unix -y ;
+sudo dos2unix run_manager.sh ;
+sudo bash run_manager.sh ;

@@ -25,6 +25,7 @@ from utils import (
     Platform, Colors, OllamaConfig, PlatformDetector, ColorOutput
 )
 from docker_manager import DockerManager
+from turboquant_manager import TurboQuantManager
 
 # For chat functionality
 try:
@@ -107,6 +108,7 @@ class OllamaManager:
         self.config_manager = ConfigManager()
         self.docker = DockerManager(self.config_manager.config)
         self.platform = PlatformDetector.get_platform()
+        self.turboquant = TurboQuantManager()
     
     def show_main_menu(self):
         """Display main menu"""
@@ -158,6 +160,18 @@ class OllamaManager:
         ColorOutput.print("USAGE:", Colors.CYAN, bold=True)
         print("  [7] Chat with Model")
         print("  [8] API Info & Network Access")
+        print()
+        
+        ColorOutput.print("TURBOQUANT (GPU Quantized Inference):", Colors.MAGENTA, bold=True)
+        tq_running = self.turboquant.is_server_running()
+        tq_installed = self.turboquant.is_turboquant_installed()
+        if tq_running:
+            tq_status = f"{Colors.GREEN}RUNNING{Colors.RESET} — port {self.turboquant.config.get('port', 8000)}"
+        elif tq_installed:
+            tq_status = f"{Colors.YELLOW}installed / stopped{Colors.RESET}"
+        else:
+            tq_status = f"{Colors.GRAY}not installed{Colors.RESET}"
+        print(f"  [T] TurboQuant Server Manager  ({tq_status})")
         print()
         
         ColorOutput.print("ADVANCED:", Colors.CYAN, bold=True)
@@ -1106,6 +1120,498 @@ class OllamaManager:
         
         input("\nPress Enter to continue...")
     
+    # Path to the dedicated TurboQuant venv — isolated from the rest of the project
+    TURBOQUANT_VENV = str(Path.home() / ".turboquant-venv")
+
+    def _install_turboquant(self) -> bool:
+        """
+        Install turboquant into a dedicated venv at ~/.turboquant-venv.
+        Uses a venv to avoid the PEP 668 externally-managed-environment error
+        on modern Debian/Ubuntu systems.  Completely isolated from the rest
+        of this project and from the system Python.
+        Returns True if installation succeeded.
+        """
+        venv_path = Path(self.TURBOQUANT_VENV)
+        venv_python = str(venv_path / "bin" / "python")
+        venv_pip    = str(venv_path / "bin" / "pip")
+
+        print()
+        ColorOutput.print("=" * 65, Colors.MAGENTA, bold=True)
+        ColorOutput.print("  Installing TurboQuant...", Colors.MAGENTA, bold=True)
+        ColorOutput.print("=" * 65, Colors.MAGENTA, bold=True)
+        print()
+        ColorOutput.print(
+            f"  Venv location: {self.TURBOQUANT_VENV}", Colors.GRAY
+        )
+        ColorOutput.print(
+            "  (Isolated from system Python and the rest of this project)", Colors.GRAY
+        )
+        print()
+
+        steps = [
+            (
+                "Installing python3-pip and python3-venv (system packages)",
+                "sudo apt install -y python3-pip python3-venv python3-full",
+            ),
+            (
+                f"Creating dedicated TurboQuant venv at {self.TURBOQUANT_VENV}",
+                f"{sys.executable} -m venv {self.TURBOQUANT_VENV}",
+            ),
+            (
+                "Upgrading pip inside venv",
+                f"{venv_pip} install --upgrade pip",
+            ),
+            (
+                "Installing turboquant inside venv",
+                f"{venv_pip} install turboquant",
+            ),
+        ]
+
+        for i, (label, cmd) in enumerate(steps, 1):
+            ColorOutput.print(f"  Step {i}/{len(steps)}: {label}", Colors.MAGENTA)
+            ColorOutput.print(f"  $ {cmd}", Colors.GRAY)
+            print()
+            try:
+                result = subprocess.run(cmd, shell=True, timeout=180)
+                if result.returncode != 0:
+                    print()
+                    ColorOutput.error(f"Step {i} failed (exit code {result.returncode})")
+                    if i == 1:
+                        ColorOutput.print(
+                            "  Tip: make sure you have internet access and sudo rights.", Colors.YELLOW
+                        )
+                    return False
+                else:
+                    ColorOutput.success(f"Step {i} done.")
+                    print()
+            except subprocess.TimeoutExpired:
+                ColorOutput.error(f"Step {i} timed out.")
+                return False
+            except Exception as e:
+                ColorOutput.error(f"Step {i} error: {e}")
+                return False
+
+        # Store the venv python path so TurboQuantManager uses it
+        self.turboquant.venv_python = venv_python
+
+        print()
+        ColorOutput.print("=" * 65, Colors.GREEN, bold=True)
+        ColorOutput.success("TurboQuant installed successfully!")
+        ColorOutput.print("=" * 65, Colors.GREEN, bold=True)
+        print()
+        ColorOutput.print(
+            "  Use [T] TurboQuant in the main menu to start a server.", Colors.CYAN
+        )
+        ColorOutput.print(
+            f"  Python used: {venv_python}", Colors.GRAY
+        )
+        print()
+        return True
+
+    def _install_nvidia_container_toolkit(self) -> bool:
+        """
+        Automatically install nvidia-container-toolkit on Linux/WSL.
+        Runs the full 5-step process with live output.
+        Returns True if installation succeeded.
+        """
+        print()
+        ColorOutput.print("=" * 65, Colors.CYAN, bold=True)
+        ColorOutput.print("  Installing nvidia-container-toolkit...", Colors.CYAN, bold=True)
+        ColorOutput.print("=" * 65, Colors.CYAN, bold=True)
+        print()
+
+        steps = [
+            (
+                "Importing NVIDIA GPG key",
+                "curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey"
+                " | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-ctk-keyring.gpg",
+            ),
+            (
+                "Adding NVIDIA apt repository",
+                "curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list"
+                " | sed \'s#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-ctk-keyring.gpg] https://#g\'"
+                " | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list",
+            ),
+            (
+                "Updating apt package lists",
+                "sudo apt-get update",
+            ),
+            (
+                "Installing nvidia-container-toolkit",
+                "sudo apt-get install -y nvidia-container-toolkit",
+            ),
+            (
+                "Configuring Docker NVIDIA runtime",
+                "sudo nvidia-ctk runtime configure --runtime=docker",
+            ),
+        ]
+
+        for i, (label, cmd) in enumerate(steps, 1):
+            ColorOutput.print(f"  Step {i}/{len(steps)}: {label}", Colors.CYAN)
+            ColorOutput.print(f"  $ {cmd}", Colors.GRAY)
+            print()
+            try:
+                result = subprocess.run(cmd, shell=True, timeout=120)
+                if result.returncode != 0:
+                    print()
+                    ColorOutput.error(f"Step {i} failed (exit code {result.returncode})")
+                    ColorOutput.print(
+                        "  You may need to run the remaining steps manually.", Colors.YELLOW
+                    )
+                    return False
+                else:
+                    ColorOutput.success(f"Step {i} done.")
+                    print()
+            except subprocess.TimeoutExpired:
+                ColorOutput.error(f"Step {i} timed out.")
+                return False
+            except Exception as e:
+                ColorOutput.error(f"Step {i} error: {e}")
+                return False
+
+        # Restart Docker daemon (WSL-safe: try service first, then systemctl)
+        ColorOutput.print("  Restarting Docker daemon...", Colors.CYAN)
+        restarted = False
+        for restart_cmd in ["sudo service docker restart", "sudo systemctl restart docker"]:
+            try:
+                r = subprocess.run(restart_cmd, shell=True, timeout=20)
+                if r.returncode == 0:
+                    ColorOutput.success("Docker restarted.")
+                    restarted = True
+                    break
+            except Exception:
+                pass
+        if not restarted:
+            ColorOutput.warning("Could not restart Docker automatically.")
+            ColorOutput.print(
+                "  Run manually: sudo service docker restart", Colors.CYAN
+            )
+
+        print()
+        ColorOutput.print("=" * 65, Colors.GREEN, bold=True)
+        ColorOutput.success("nvidia-container-toolkit installed and configured!")
+        ColorOutput.print("=" * 65, Colors.GREEN, bold=True)
+        print()
+        ColorOutput.print(
+            "  Verify GPU access with:",
+            Colors.CYAN
+        )
+        ColorOutput.print(
+            "  docker run --rm --gpus all nvidia/cuda:11.8.0-base-ubuntu22.04 nvidia-smi",
+            Colors.WHITE
+        )
+        print()
+        return True
+
+    def _show_linux_requirements(self):
+        """
+        Display a clear requirements/prerequisites screen for Linux & WSL users.
+        Shows what is needed, checks what is present, and lets the user proceed.
+        GPU requirements are clearly highlighted since Ollama and TurboQuant both
+        rely on the NVIDIA stack being set up correctly.
+        """
+        os.system('clear')
+
+        print()
+        ColorOutput.print("=" * 65, Colors.CYAN, bold=True)
+        ColorOutput.print("   📋  LINUX / WSL  —  REQUIREMENTS OVERVIEW", Colors.CYAN, bold=True)
+        ColorOutput.print("=" * 65, Colors.CYAN, bold=True)
+        print()
+        ColorOutput.print(
+            "This manager runs Ollama inside Docker and can also launch",
+            Colors.WHITE
+        )
+        ColorOutput.print(
+            "TurboQuant for quantized GPU inference.  Both benefit greatly",
+            Colors.WHITE
+        )
+        ColorOutput.print("from a properly configured NVIDIA GPU stack.", Colors.WHITE)
+        print()
+
+        # ── Section 1: Core requirements (always needed) ──────────────────────
+        ColorOutput.print("─" * 65, Colors.GRAY)
+        ColorOutput.print("  CORE REQUIREMENTS  (always needed)", Colors.CYAN, bold=True)
+        ColorOutput.print("─" * 65, Colors.GRAY)
+        print()
+
+        # Docker
+        try:
+            dr = subprocess.run(['docker', '--version'], capture_output=True, text=True, timeout=5)
+            docker_ok = dr.returncode == 0
+            docker_ver = dr.stdout.strip() if docker_ok else ""
+        except Exception:
+            docker_ok = False
+            docker_ver = ""
+
+        if docker_ok:
+            ColorOutput.print(f"  ✅  Docker          — {docker_ver}", Colors.GREEN)
+        else:
+            ColorOutput.print("  ❌  Docker          — NOT FOUND", Colors.RED)
+            ColorOutput.print("      Install: sudo apt install docker.io  (Ubuntu/Debian)", Colors.GRAY)
+            ColorOutput.print("      Or:      https://docs.docker.com/engine/install/", Colors.GRAY)
+
+        # Python 3
+        try:
+            pr = subprocess.run(['python3', '--version'], capture_output=True, text=True, timeout=5)
+            py_ok = pr.returncode == 0
+            py_ver = pr.stdout.strip() if py_ok else ""
+        except Exception:
+            py_ok = False
+            py_ver = ""
+
+        if py_ok:
+            ColorOutput.print(f"  ✅  Python 3        — {py_ver}", Colors.GREEN)
+        else:
+            ColorOutput.print("  ❌  Python 3        — NOT FOUND", Colors.RED)
+            ColorOutput.print("      Install: sudo apt install python3", Colors.GRAY)
+
+        # pip / requests
+        try:
+            rr = subprocess.run(
+                ['python3', '-c', 'import requests'],
+                capture_output=True, timeout=5
+            )
+            req_ok = rr.returncode == 0
+        except Exception:
+            req_ok = False
+
+        if req_ok:
+            ColorOutput.print("  ✅  requests lib    — available", Colors.GREEN)
+        else:
+            ColorOutput.print("  ⚠️   requests lib    — missing (needed for chat feature)", Colors.YELLOW)
+            ColorOutput.print("      Install: pip install requests --user", Colors.GRAY)
+
+        print()
+
+        # ── Section 2: GPU requirements ───────────────────────────────────────
+        ColorOutput.print("─" * 65, Colors.GRAY)
+        ColorOutput.print(
+            "  GPU REQUIREMENTS  (for NVIDIA GPU acceleration)",
+            Colors.CYAN, bold=True
+        )
+        ColorOutput.print(
+            "  Needed for: Ollama GPU mode  •  TurboQuant inference",
+            Colors.GRAY
+        )
+        ColorOutput.print("─" * 65, Colors.GRAY)
+        print()
+        ColorOutput.print(
+            "  If you only have a CPU, skip this section — CPU-only mode works.",
+            Colors.GRAY
+        )
+        print()
+
+        # nvidia-smi
+        try:
+            nr = subprocess.run(['nvidia-smi'], capture_output=True, timeout=8)
+            nsmi_ok = nr.returncode == 0
+            if nsmi_ok:
+                # grab first relevant line (GPU name)
+                lines = nr.stdout.decode('utf-8', errors='ignore').splitlines()
+                gpu_line = next(
+                    (l for l in lines if 'GeForce' in l or 'RTX' in l or 'GTX' in l
+                     or 'Quadro' in l or 'Tesla' in l or 'A100' in l or 'H100' in l),
+                    ""
+                ).strip()
+        except Exception:
+            nsmi_ok = False
+            gpu_line = ""
+
+        if nsmi_ok:
+            ColorOutput.print("  ✅  nvidia-smi      — NVIDIA driver is working", Colors.GREEN)
+            if gpu_line:
+                ColorOutput.print(f"      GPU: {gpu_line}", Colors.GRAY)
+        else:
+            ColorOutput.print("  ❌  nvidia-smi      — NVIDIA driver NOT found / not working", Colors.RED)
+            ColorOutput.print("      Ubuntu:  sudo apt install nvidia-driver-535", Colors.GRAY)
+            ColorOutput.print("      Or use:  sudo ubuntu-drivers autoinstall", Colors.GRAY)
+            if self.platform == Platform.WSL:
+                ColorOutput.print(
+                    "      WSL:     Install drivers in *Windows*, then restart WSL", Colors.YELLOW
+                )
+
+        # nvidia-container-toolkit
+        try:
+            cr = subprocess.run(
+                ['which', 'nvidia-container-runtime'],
+                capture_output=True, timeout=5
+            )
+            ctk_ok = cr.returncode == 0
+        except Exception:
+            ctk_ok = False
+
+        if ctk_ok:
+            ColorOutput.print("  ✅  nvidia-container-toolkit — installed", Colors.GREEN)
+        else:
+            ColorOutput.print("  ❌  nvidia-container-toolkit — NOT installed", Colors.RED)
+            ColorOutput.print(
+                "      Required so Docker containers can access your GPU.", Colors.GRAY
+            )
+            print()
+            ColorOutput.print(
+                "  Would you like to install nvidia-container-toolkit automatically?",
+                Colors.CYAN
+            )
+            print("  This will run (with sudo):")
+            ColorOutput.print("    1. Import NVIDIA GPG key", Colors.GRAY)
+            ColorOutput.print("    2. Add NVIDIA apt repository", Colors.GRAY)
+            ColorOutput.print("    3. apt-get install nvidia-container-toolkit", Colors.GRAY)
+            ColorOutput.print("    4. nvidia-ctk runtime configure --runtime=docker", Colors.GRAY)
+            print()
+            ans = input("  Install now? (y/n): ").strip().lower()
+            if ans == 'y':
+                ctk_ok = self._install_nvidia_container_toolkit()
+            else:
+                ColorOutput.print("  Skipped. Manual install commands:", Colors.YELLOW)
+                ColorOutput.print(
+                    "    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey"
+                    " | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-ctk-keyring.gpg",
+                    Colors.GRAY
+                )
+                ColorOutput.print(
+                    "    curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list"
+                    " | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-ctk-keyring.gpg] https://#g'"
+                    " | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list",
+                    Colors.GRAY
+                )
+                ColorOutput.print(
+                    "    sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit",
+                    Colors.GRAY
+                )
+                ColorOutput.print(
+                    "    sudo nvidia-ctk runtime configure --runtime=docker", Colors.GRAY
+                )
+            print()
+
+        # Docker daemon NVIDIA runtime
+        daemon_ok = False
+        try:
+            import json as _json
+            daemon_path = '/etc/docker/daemon.json'
+            if os.path.exists(daemon_path):
+                with open(daemon_path) as f:
+                    d = _json.load(f)
+                    if d.get('default-runtime') == 'nvidia' or 'nvidia' in d.get('runtimes', {}):
+                        daemon_ok = True
+        except Exception:
+            pass
+
+        if daemon_ok:
+            ColorOutput.print("  ✅  Docker NVIDIA runtime — configured in daemon.json", Colors.GREEN)
+        else:
+            ColorOutput.print("  ⚠️   Docker NVIDIA runtime — not configured (or unverifiable)", Colors.YELLOW)
+            ColorOutput.print(
+                "      Add to /etc/docker/daemon.json:", Colors.GRAY
+            )
+            ColorOutput.print(
+                '      { "default-runtime": "nvidia", "runtimes": { "nvidia": '
+                '{ "path": "nvidia-container-runtime", "runtimeArgs": [] } } }',
+                Colors.GRAY
+            )
+            ColorOutput.print(
+                "      Then: sudo systemctl restart docker", Colors.GRAY
+            )
+
+        # CUDA (host-level, informational)
+        try:
+            nvcc = subprocess.run(
+                ['nvcc', '--version'], capture_output=True, text=True, timeout=5
+            )
+            cuda_ok = nvcc.returncode == 0
+            cuda_ver = ""
+            if cuda_ok:
+                for line in nvcc.stdout.splitlines():
+                    if 'release' in line.lower():
+                        cuda_ver = line.strip()
+                        break
+        except Exception:
+            cuda_ok = False
+            cuda_ver = ""
+
+        if cuda_ok:
+            ColorOutput.print(f"  ✅  CUDA (nvcc)     — {cuda_ver}", Colors.GREEN)
+        else:
+            ColorOutput.print(
+                "  ℹ️   CUDA (nvcc)     — not found on host PATH (optional for Docker use)", Colors.GRAY
+            )
+            ColorOutput.print(
+                "      Docker images carry their own CUDA runtime.", Colors.GRAY
+            )
+            ColorOutput.print(
+                "      TurboQuant needs CUDA libs; install via: sudo apt install nvidia-cuda-toolkit",
+                Colors.GRAY
+            )
+
+        print()
+
+        # ── Section 3: TurboQuant-specific ───────────────────────────────────
+        ColorOutput.print("─" * 65, Colors.GRAY)
+        ColorOutput.print(
+            "  TURBOQUANT REQUIREMENTS  (only if using TurboQuant menu)",
+            Colors.CYAN, bold=True
+        )
+        ColorOutput.print("─" * 65, Colors.GRAY)
+        print()
+
+        tq_installed = self.turboquant.is_turboquant_installed()
+        if tq_installed:
+            ColorOutput.print("  ✅  turboquant      — pip package installed", Colors.GREEN)
+        else:
+            ColorOutput.print("  ℹ️   turboquant      — not yet installed", Colors.GRAY)
+            print()
+            ColorOutput.print(
+                "  Would you like to install TurboQuant automatically?", Colors.CYAN
+            )
+            print("  This will run:")
+            ColorOutput.print("    pip install turboquant --user", Colors.GRAY)
+            ColorOutput.print(
+                "    echo 'export PATH=$HOME/.local/bin:$PATH' >> ~/.bashrc", Colors.GRAY
+            )
+            print()
+            ans = input("  Install now? (y/n): ").strip().lower()
+            if ans == "y":
+                tq_installed = self._install_turboquant()
+            else:
+                ColorOutput.print("  Skipped. You can install later from the [T] menu.", Colors.YELLOW)
+
+        print()
+        ColorOutput.print("─" * 65, Colors.GRAY)
+        print()
+
+        # Count issues
+        issues = []
+        if not docker_ok:    issues.append("Docker")
+        if not nsmi_ok:      issues.append("NVIDIA driver")
+        if not ctk_ok:       issues.append("nvidia-container-toolkit")
+
+        if not issues:
+            ColorOutput.print(
+                "  🎉  All core requirements met! Your system is GPU-ready.",
+                Colors.GREEN, bold=True
+            )
+        else:
+            ColorOutput.print(
+                f"  ⚠️  Missing: {', '.join(issues)}",
+                Colors.YELLOW, bold=True
+            )
+            ColorOutput.print(
+                "  You can still use CPU-only Ollama; GPU features won't work until fixed.",
+                Colors.GRAY
+            )
+
+        print()
+        ColorOutput.print(
+            "  Press Enter to continue to the main menu, or Ctrl+C to exit.",
+            Colors.CYAN
+        )
+        print()
+        try:
+            input()
+        except KeyboardInterrupt:
+            print()
+            ColorOutput.info("Goodbye!")
+            sys.exit(0)
+
     def run(self):
         """Main application loop"""
         # Check if Docker is running
@@ -1163,6 +1669,10 @@ class OllamaManager:
             print()
             return
         
+        # ── Linux / WSL: show requirements screen on first run ────────────────
+        if self.platform in (Platform.LINUX, Platform.WSL):
+            self._show_linux_requirements()
+        
         while True:
             try:
                 # Clear screen (cross-platform)
@@ -1198,6 +1708,8 @@ class OllamaManager:
                     self.chat_menu()
                 elif choice == '8':
                     self.show_api_info()
+                elif choice == 'T':
+                    self.turboquant.show_menu()
                 elif choice == 'S':
                     self.handle_settings()
                 elif choice == '9':

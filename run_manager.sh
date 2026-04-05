@@ -19,6 +19,8 @@ echo -e "${CYAN}================================================================
 echo ""
 
 # Check if Python is installed
+echo -e "${CYAN}Checking if Python is installed...${NC}"
+
 PYTHON_CMD=""
 for cmd in python3 python; do
     if command -v $cmd &> /dev/null; then
@@ -59,9 +61,6 @@ else
     fi
 fi
 
-echo ""
-echo -e "${CYAN}Checking Docker status...${NC}"
-
 # Check Docker
 if command -v docker &> /dev/null; then
     # Docker command exists, now check if daemon is running (with timeout)
@@ -81,7 +80,9 @@ if command -v docker &> /dev/null; then
             echo -e "${YELLOW}  WSL detected:${NC}"
             echo "    1. Open Docker Desktop in Windows (from Start Menu)"
             echo "    2. Wait for it to fully start (icon in system tray should be green)"
-            echo "    3. Make sure WSL2 integration is enabled in Docker Desktop settings"
+            echo "    3. Enable WSL2 integration for your distro:"
+            echo "       Settings → Resources → WSL Integration → Ubuntu"
+            echo "       (toggle it ON, then click 'Apply & Restart')"
         else
             echo -e "${YELLOW}  Linux:${NC}"
             echo "    Run: sudo systemctl start docker"
