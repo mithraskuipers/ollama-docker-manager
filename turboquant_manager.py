@@ -14,6 +14,7 @@ Typical usage flow:
 import os
 import sys
 import json
+import shutil
 import subprocess
 import threading
 import time
@@ -163,6 +164,94 @@ class TurboQuantManager:
             return True
         return False
 
+    @staticmethod
+    def _port_in_use(port: int) -> bool:
+        """Return True if something is already bound to *port* on localhost."""
+        import socket as _sock
+        with _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM) as s:
+            s.settimeout(1)
+            return s.connect_ex(("127.0.0.1", port)) == 0
+
+    @staticmethod
+    def _find_free_port(start: int = 8000, tries: int = 20) -> int:
+        """Return the first free TCP port at or above *start*."""
+        import socket as _sock
+        for p in range(start, start + tries):
+            with _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM) as s:
+                s.settimeout(1)
+                if s.connect_ex(("127.0.0.1", p)) != 0:
+                    return p
+        return start + tries  # best-effort fallback
+
+    def _resolve_port_conflict(self, port: int) -> int:
+        """
+        Called when *port* is already in use before we launch the server.
+        Presents options to the user and returns the port to use, or -1 to abort.
+        """
+        suggested = self._find_free_port(port + 1)
+
+        print()
+        ColorOutput.print("⚠  PORT CONFLICT DETECTED", Colors.RED, bold=True)
+        ColorOutput.print(f"   Port {port} is already in use.", Colors.YELLOW)
+        print()
+        ColorOutput.print("What would you like to do?", Colors.CYAN, bold=True)
+        print()
+        print(f"  [1] Kill the process on port {port} and use it")
+        print(f"  [2] Use a different port (auto-suggested: {suggested})")
+        print(f"  [3] Enter a custom port number")
+        print( "  [0] Cancel — go back to menu")
+        print()
+
+        choice = input("Select option: ").strip()
+
+        if choice == "0":
+            ColorOutput.info("Cancelled.")
+            return -1
+
+        elif choice == "1":
+            ColorOutput.info(f"Killing process on port {port}...")
+            if kill_process_on_port(port):
+                ColorOutput.success(f"Port {port} freed.")
+                # Brief pause to let the OS release the socket
+                time.sleep(1)
+                # Confirm it's actually free now
+                if self._port_in_use(port):
+                    ColorOutput.warning(f"Port {port} still appears to be in use.")
+                    retry = input("Try a different port instead? (y/n): ").strip().lower()
+                    if retry == "y":
+                        return self._resolve_port_conflict(port)
+                    return -1
+                return port
+            else:
+                ColorOutput.warning(f"Could not kill process on port {port}.")
+                ColorOutput.print("  You may need to kill it manually (sudo may be required).", Colors.GRAY)
+                retry = input("Try a different port instead? (y/n): ").strip().lower()
+                if retry == "y":
+                    return self._resolve_port_conflict(port)
+                return -1
+
+        elif choice == "2":
+            ColorOutput.success(f"Using port {suggested}.")
+            return suggested
+
+        elif choice == "3":
+            raw = input("Enter port number: ").strip()
+            if not raw.isdigit():
+                ColorOutput.error("Invalid port number.")
+                return self._resolve_port_conflict(port)
+            custom = int(raw)
+            if not (1024 <= custom <= 65535):
+                ColorOutput.error("Port must be between 1024 and 65535.")
+                return self._resolve_port_conflict(port)
+            if self._port_in_use(custom):
+                ColorOutput.warning(f"Port {custom} is also in use.")
+                return self._resolve_port_conflict(custom)
+            return custom
+
+        else:
+            ColorOutput.error("Invalid selection.")
+            return self._resolve_port_conflict(port)
+
     def start_server(self, model: str, bits: int, port: int, hf_token: str = "") -> bool:
         """Start the TurboQuant inference server in a background thread."""
         if self.is_server_running():
@@ -175,6 +264,12 @@ class TurboQuantManager:
             if ans != "y":
                 return False
             if not self.install_turboquant():
+                return False
+
+        # ── Port conflict check BEFORE loading the model ──────────────────────
+        if self._port_in_use(port):
+            port = self._resolve_port_conflict(port)
+            if port == -1:
                 return False
 
         py = self.venv_python  # uses venv if installed there, else system python
@@ -471,7 +566,12 @@ class TurboQuantManager:
     def _ask_bits(self, default: int = 4) -> int:
         """Prompt for quantization bits (4 or 8), returning the default on invalid input."""
         other = 8 if default == 4 else 4
-        raw = input(f"Quantization bits [{default}] / {other}: ").strip()
+        print()
+        ColorOutput.print("Quantization precision:", Colors.CYAN, bold=True)
+        ColorOutput.print(f"  [{default}] {default}-bit  ← recommended (smaller, faster, uses less VRAM)", Colors.WHITE)
+        ColorOutput.print(f"  [{other}] {other}-bit       (higher quality, uses more VRAM)", Colors.GRAY)
+        print()
+        raw = input(f"Choose precision (press Enter for {default}-bit): ").strip()
         if not raw:
             return default
         try:
@@ -482,6 +582,272 @@ class TurboQuantManager:
         except ValueError:
             ColorOutput.warning(f"Invalid value — using {default}-bit.")
             return default
+
+    def _get_downloaded_models(self) -> List[Dict]:
+        """
+        Scan the HuggingFace hub cache and return models that are present locally.
+        Cross-references turboquant-models.json for labels/descriptions.
+        Also includes the currently configured model even if not in catalog.
+        """
+        catalog = {m["id"]: m for m in self._load_models_list()}
+
+        downloaded_ids: List[str] = []
+        for cache_dir in self._hf_cache_dirs():
+            # The actual model dirs live in the hub/ subdir
+            hub_dir = cache_dir / "hub" if (cache_dir / "hub").exists() else cache_dir
+            if not hub_dir.exists():
+                continue
+            for entry in hub_dir.iterdir():
+                if entry.is_dir() and entry.name.startswith("models--"):
+                    # "models--Qwen--Qwen2.5-3B-Instruct" -> "Qwen/Qwen2.5-3B-Instruct"
+                    parts = entry.name[len("models--"):].split("--", 1)
+                    if len(parts) == 2:
+                        hf_id = f"{parts[0]}/{parts[1]}"
+                        if hf_id not in downloaded_ids:
+                            downloaded_ids.append(hf_id)
+
+        result = []
+        for hf_id in downloaded_ids:
+            if hf_id in catalog:
+                result.append(dict(catalog[hf_id]))
+            else:
+                result.append({
+                    "id": hf_id,
+                    "label": hf_id,
+                    "bits": 4,
+                    "vram_gb": "?",
+                    "description": "Custom / unlisted model",
+                })
+
+        # Always include currently configured model so it can be selected
+        current = self.config.get("model", "")
+        if current and current not in [m["id"] for m in result]:
+            entry = dict(catalog.get(current, {
+                "id": current,
+                "label": current,
+                "bits": self.config.get("bits", 4),
+                "vram_gb": "?",
+                "description": "Currently configured model",
+            }))
+            result.append(entry)
+
+        return result
+
+    def _pick_downloaded_model(self) -> Tuple[str, int]:
+        """
+        Pick from models already downloaded locally.
+        Returns (model_id, bits) or ("", 0) on cancel.
+        """
+        downloaded = self._get_downloaded_models()
+
+        print()
+        ColorOutput.print("SELECT ACTIVE MODEL", Colors.CYAN, bold=True)
+        ColorOutput.print("Only showing models already downloaded on this machine.", Colors.GRAY)
+        print()
+
+        if not downloaded:
+            ColorOutput.warning("No downloaded TurboQuant models found on this machine.")
+            ColorOutput.print("  Use [D] Download a Model to get one first.", Colors.GRAY)
+            print()
+            input("Press Enter to go back...")
+            return "", 0
+
+        current = self.config.get("model", "")
+        for i, m in enumerate(downloaded, 1):
+            hf_id  = m.get("id", "")
+            label  = m.get("label") or hf_id
+            vram   = m.get("vram_gb", "?")
+            bits   = m.get("bits", 4)
+            marker = f"  {Colors.GREEN}← currently active{Colors.RESET}" if hf_id == current else ""
+            ColorOutput.print(f"  [{i}] {label}{marker}", Colors.WHITE, bold=True)
+            ColorOutput.print(f"      {hf_id}", Colors.GRAY)
+            ColorOutput.print(f"      VRAM: {vram}  |  Default: {bits}-bit", Colors.GRAY)
+            print()
+
+        ColorOutput.print("─" * 60, Colors.GRAY)
+        print()
+        print("  [0] Cancel")
+        print()
+
+        raw = input("Select model number: ").strip()
+        if raw == "0" or not raw:
+            return "", 0
+
+        try:
+            idx = int(raw) - 1
+            if 0 <= idx < len(downloaded):
+                m            = downloaded[idx]
+                default_bits = m.get("bits", 4)
+                bits         = self._ask_bits(default_bits)
+                return m["id"], bits
+        except (ValueError, IndexError):
+            pass
+
+        ColorOutput.error("Invalid selection.")
+        return "", 0
+
+    # ── Cleanup / reset helpers ───────────────────────────────────────────────
+
+    @staticmethod
+    def _hf_cache_dirs() -> List[Path]:
+        """
+        Return all candidate HuggingFace model cache directories.
+        Respects HF_HOME / HUGGINGFACE_HUB_CACHE env vars when set.
+        """
+        candidates = []
+
+        # Explicit env overrides
+        hf_home = os.environ.get("HF_HOME")
+        if hf_home:
+            candidates.append(Path(hf_home) / "hub")
+
+        hf_hub_cache = os.environ.get("HUGGINGFACE_HUB_CACHE")
+        if hf_hub_cache:
+            candidates.append(Path(hf_hub_cache))
+
+        # Default locations
+        candidates += [
+            Path.home() / ".cache" / "huggingface" / "hub",
+            Path.home() / ".cache" / "huggingface",
+        ]
+
+        return candidates
+
+    def stop_all_servers(self) -> None:
+        """
+        Stop the managed server process AND kill anything listening on the
+        configured port (and the default port 8000 if different).
+        """
+        stopped_any = False
+
+        # Gracefully stop our own managed process first
+        if self.is_server_running():
+            ColorOutput.info("Stopping managed TurboQuant server process...")
+            try:
+                self._server_proc.terminate()
+                self._server_proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self._server_proc.kill()
+            self._server_proc = None
+            ColorOutput.success("Managed server stopped.")
+            stopped_any = True
+
+        # Kill by configured port
+        port = self.config.get("port", 8000)
+        ColorOutput.info(f"Killing any process on configured port {port}...")
+        if kill_process_on_port(port):
+            ColorOutput.success(f"Killed process on port {port}.")
+            stopped_any = True
+        else:
+            ColorOutput.print(f"  No process found on port {port}.", Colors.GRAY)
+
+        # Also kill on default port 8000 if different
+        if port != 8000:
+            ColorOutput.info("Killing any process on default port 8000...")
+            if kill_process_on_port(8000):
+                ColorOutput.success("Killed process on port 8000.")
+                stopped_any = True
+            else:
+                ColorOutput.print("  No process found on port 8000.", Colors.GRAY)
+
+        if not stopped_any:
+            ColorOutput.info("No running TurboQuant servers found.")
+
+    def reset_config_keep_models(self) -> bool:
+        """
+        Delete the TurboQuant config file and restore defaults.
+        HuggingFace model cache is left untouched.
+        """
+        ColorOutput.info("Resetting TurboQuant configuration to defaults...")
+
+        # Stop server first
+        if self.is_server_running():
+            self.stop_all_servers()
+
+        # Remove config file
+        cfg_path = Path(TURBOQUANT_CONFIG_FILE)
+        if cfg_path.exists():
+            cfg_path.unlink()
+            ColorOutput.success(f"Removed config file: {TURBOQUANT_CONFIG_FILE}")
+        else:
+            ColorOutput.print("  Config file did not exist.", Colors.GRAY)
+
+        # Reset in-memory config to defaults
+        self.config = dict(DEFAULT_TQ_CONFIG)
+        ColorOutput.success("TurboQuant configuration reset to defaults.")
+        ColorOutput.print("  Downloaded models (HuggingFace cache) are preserved.", Colors.GRAY)
+        return True
+
+    def reset_config_and_models(self) -> bool:
+        """
+        Reset config AND delete all downloaded HuggingFace model weights.
+        The turboquant package itself (venv) is kept.
+        """
+        ColorOutput.info("Resetting TurboQuant config and removing downloaded models...")
+
+        # Stop server first
+        if self.is_server_running():
+            self.stop_all_servers()
+
+        # Reset config
+        self.reset_config_keep_models()
+
+        # Remove HF model cache
+        removed_any = False
+        for cache_dir in self._hf_cache_dirs():
+            if cache_dir.exists():
+                ColorOutput.info(f"Removing HuggingFace cache: {cache_dir}")
+                try:
+                    shutil.rmtree(cache_dir)
+                    ColorOutput.success(f"Removed: {cache_dir}")
+                    removed_any = True
+                except Exception as exc:
+                    ColorOutput.warning(f"Could not remove {cache_dir}: {exc}")
+            else:
+                ColorOutput.print(f"  Not found (skipping): {cache_dir}", Colors.GRAY)
+
+        if not removed_any:
+            ColorOutput.print("  No HuggingFace model cache directories found.", Colors.GRAY)
+
+        ColorOutput.success("TurboQuant config and model cache cleared.")
+        return True
+
+    def full_uninstall(self) -> bool:
+        """
+        Complete TurboQuant removal:
+          - Stop server
+          - Delete config file
+          - Delete HuggingFace model cache
+          - Uninstall turboquant + accelerate from the shared venv
+        The shared venv itself is kept (other tools may use it).
+        """
+        ColorOutput.info("Starting full TurboQuant uninstall...")
+
+        # Stop server and clear config + models
+        self.reset_config_and_models()
+
+        # Uninstall packages from the shared venv
+        py = self.venv_python
+        for pkg in ("turboquant", "accelerate"):
+            ColorOutput.info(f"Uninstalling {pkg} from venv...")
+            try:
+                result = subprocess.run(
+                    [py, "-m", "pip", "uninstall", "-y", pkg],
+                    capture_output=True, text=True, timeout=60,
+                )
+                if result.returncode == 0:
+                    ColorOutput.success(f"Uninstalled {pkg}.")
+                else:
+                    ColorOutput.print(f"  {pkg} was not installed (or already removed).", Colors.GRAY)
+            except Exception as exc:
+                ColorOutput.warning(f"Could not uninstall {pkg}: {exc}")
+
+        ColorOutput.success("Full TurboQuant uninstall complete.")
+        ColorOutput.print(
+            "  The shared venv is kept — use [I] to reinstall TurboQuant at any time.",
+            Colors.GRAY,
+        )
+        return True
 
     # ── Main menu ─────────────────────────────────────────────────────────────
 
@@ -540,11 +906,16 @@ class TurboQuantManager:
             else:
                 ColorOutput.print("  SERVER", Colors.CYAN, bold=True)
                 if not running:
-                    print("    [1] Start Server      (launches inference on the configured model)")
-                    print("    [2] Start with a different model")
+                    print("    [1] Start Server      (start the currently selected model)")
                 else:
-                    print("    [3] Stop Server")
+                    print("    [3] Stop Server       (stop managed server process)")
                     print("    [4] Force-kill server on port  (if Stop doesn't work)")
+                print("    [K] Stop ALL servers  (kill managed process + free ports 8000 & configured)")
+                print()
+
+                ColorOutput.print("  MODELS", Colors.CYAN, bold=True)
+                print("    [S] Select active model   (choose from already-downloaded models)")
+                print("    [D] Download a new model  (browse catalog, downloads on first use)")
                 print()
 
                 ColorOutput.print("  TEST & INSPECT", Colors.CYAN, bold=True)
@@ -553,13 +924,19 @@ class TurboQuantManager:
                 print()
 
                 ColorOutput.print("  CONFIGURE", Colors.CYAN, bold=True)
-                print("    [7] Change model, quantization bits, or port")
+                print("    [7] Change port")
                 print("    [8] Set HuggingFace token  (required for Llama, Gemma, etc.)")
                 print()
 
                 ColorOutput.print("  SETUP", Colors.CYAN, bold=True)
                 print("    [I] Re-install / upgrade TurboQuant")
                 print()
+
+            ColorOutput.print("  RESET / UNINSTALL", Colors.RED, bold=True)
+            print("    [A] Reset config only          (keeps downloaded models)")
+            print("    [B] Reset config + delete models  (removes HuggingFace cache)")
+            print("    [C] Full uninstall             (config + models + pip packages)")
+            print()
 
             print("    [0] Back to main menu")
             print()
@@ -572,7 +949,7 @@ class TurboQuantManager:
             if choice == "0":
                 break
 
-            # ── I — install ──────────────────────────────────────────────────
+            # ── I — install turboquant package ───────────────────────────────
             elif choice == "I":
                 print()
                 if installed:
@@ -586,7 +963,8 @@ class TurboQuantManager:
             # ── 1 — start with saved config ──────────────────────────────────
             elif choice == "1" and installed and not running:
                 if not model or model == "—":
-                    ColorOutput.warning("No model configured yet. Use [2] to pick one first.")
+                    ColorOutput.warning("No model selected yet.")
+                    ColorOutput.print("  Use [S] to pick a downloaded model, or [D] to download one first.", Colors.GRAY)
                     input("\nPress Enter to continue...")
                     continue
                 print()
@@ -595,19 +973,42 @@ class TurboQuantManager:
                 self.start_server(model, bits, port, hf_token)
                 input("\nPress Enter to continue...")
 
-            # ── 2 — pick a different model then start ─────────────────────────
-            elif choice == "2" and installed and not running:
+            # ── S — select from already-downloaded models ─────────────────────
+            elif choice == "S" and installed:
+                if running:
+                    ColorOutput.warning("Server is currently running.")
+                    ColorOutput.print("  Stop the server first, then change the active model.", Colors.GRAY)
+                    input("\nPress Enter to continue...")
+                    continue
+                print()
+                new_model, new_bits = self._pick_downloaded_model()
+                if new_model:
+                    self.config["model"] = new_model
+                    self.config["bits"]  = new_bits
+                    self._save_config()
+                    print()
+                    ColorOutput.success(f"Active model set to: {new_model}  ({new_bits}-bit)")
+                    ColorOutput.print("  Press [1] to start the server.", Colors.GRAY)
+                    input("\nPress Enter to continue...")
+
+            # ── D — download a new model from the catalog ─────────────────────
+            elif choice == "D" and installed:
+                print()
+                ColorOutput.print("DOWNLOAD A MODEL", Colors.CYAN, bold=True)
+                ColorOutput.print("The model will be downloaded from HuggingFace when you first start the server.", Colors.GRAY)
+                ColorOutput.print("Sizes range from ~1 GB to ~15 GB depending on the model.", Colors.GRAY)
                 print()
                 new_model, new_bits = self._pick_model()
-                if not new_model:
-                    continue
-                port_str = input(f"Port [{port}]: ").strip() or str(port)
-                try:
-                    port = int(port_str)
-                except ValueError:
-                    port = self.config.get("port", 8000)
-                print()
-                self.start_server(new_model, new_bits, port, hf_token)
+                if new_model:
+                    self.config["model"] = new_model
+                    self.config["bits"]  = new_bits
+                    self._save_config()
+                    print()
+                    ColorOutput.success(f"Configured: {new_model}  ({new_bits}-bit)")
+                    if running:
+                        ColorOutput.warning("Server is running with the old model — restart to apply.")
+                    else:
+                        ColorOutput.print("  Press [1] to start the server (download happens on first launch).", Colors.GRAY)
                 input("\nPress Enter to continue...")
 
             # ── 3 — stop ─────────────────────────────────────────────────────
@@ -627,7 +1028,7 @@ class TurboQuantManager:
             elif choice == "5" and installed:
                 print()
                 if not running:
-                    ColorOutput.warning("Server is not running. Start it first with [1] or [2].")
+                    ColorOutput.warning("Server is not running. Start it first with [1].")
                 else:
                     self.test_server(port)
                 input("\nPress Enter to continue...")
@@ -637,26 +1038,27 @@ class TurboQuantManager:
                 self._show_api_info()
                 input("\nPress Enter to continue...")
 
-            # ── 7 — change config ─────────────────────────────────────────────
+            # ── 7 — change port ───────────────────────────────────────────────
             elif choice == "7" and installed:
                 print()
-                new_model, new_bits = self._pick_model()
-                if new_model:
-                    port_str = input(
-                        f"Port [{self.config.get('port', 8000)}]: "
-                    ).strip() or str(self.config.get("port", 8000))
-                    try:
-                        new_port = int(port_str)
-                    except ValueError:
-                        new_port = self.config.get("port", 8000)
-                    self.config["model"] = new_model
-                    self.config["bits"]  = new_bits
-                    self.config["port"]  = new_port
-                    self._save_config()
-                    print()
-                    ColorOutput.success("Configuration saved.")
-                    if running:
-                        ColorOutput.warning("Server is running with the old model. Restart it to apply changes.")
+                ColorOutput.print("CHANGE PORT", Colors.CYAN, bold=True)
+                print()
+                ColorOutput.print(f"Current port: {self.config.get('port', 8000)}", Colors.WHITE)
+                print()
+                port_str = input(f"Enter new port (press Enter to keep {self.config.get('port', 8000)}): ").strip()
+                if port_str:
+                    if port_str.isdigit() and 1024 <= int(port_str) <= 65535:
+                        self.config["port"] = int(port_str)
+                        self._save_config()
+                        port = self.config["port"]
+                        print()
+                        ColorOutput.success(f"Port changed to {port}.")
+                        if running:
+                            ColorOutput.warning("Server is running — restart it for the new port to take effect.")
+                    else:
+                        ColorOutput.error("Invalid port. Must be between 1024 and 65535.")
+                else:
+                    ColorOutput.info("Port unchanged.")
                 input("\nPress Enter to continue...")
 
             # ── 8 — HF token ─────────────────────────────────────────────────
@@ -672,6 +1074,76 @@ class TurboQuantManager:
                 self._save_config()
                 print()
                 ColorOutput.success("Token saved.") if token else ColorOutput.info("Token cleared.")
+                input("\nPress Enter to continue...")
+
+            # ── K — stop all servers ──────────────────────────────────────────
+            elif choice == "K":
+                print()
+                self.stop_all_servers()
+                self._server_proc = None
+                input("\nPress Enter to continue...")
+
+            # ── A — reset config, keep models ─────────────────────────────────
+            elif choice == "A":
+                print()
+                ColorOutput.print("RESET TURBOQUANT CONFIG", Colors.RED, bold=True)
+                print()
+                ColorOutput.print("This will:", Colors.WHITE)
+                print("  • Stop any running TurboQuant server")
+                print("  • Delete turboquant-config.json")
+                print("  • Reset all settings to defaults")
+                ColorOutput.print("  • Keep your downloaded HuggingFace model files", Colors.GREEN)
+                print()
+                confirm = input("Continue? (yes/no): ").strip().lower()
+                if confirm == "yes":
+                    print()
+                    self.reset_config_keep_models()
+                else:
+                    ColorOutput.info("Cancelled.")
+                input("\nPress Enter to continue...")
+
+            # ── B — reset config + delete models ──────────────────────────────
+            elif choice == "B":
+                print()
+                ColorOutput.print("RESET CONFIG + DELETE DOWNLOADED MODELS", Colors.RED, bold=True)
+                print()
+                ColorOutput.print("This will:", Colors.WHITE)
+                print("  • Stop any running TurboQuant server")
+                print("  • Delete turboquant-config.json")
+                print("  • Reset all settings to defaults")
+                ColorOutput.print("  • Delete the HuggingFace model cache (~/.cache/huggingface)", Colors.RED)
+                print()
+                ColorOutput.warning("Downloaded model files will be permanently deleted!")
+                ColorOutput.print("  turboquant and accelerate packages are kept.", Colors.GRAY)
+                print()
+                confirm = input("Continue? (yes/no): ").strip().lower()
+                if confirm == "yes":
+                    print()
+                    self.reset_config_and_models()
+                else:
+                    ColorOutput.info("Cancelled.")
+                input("\nPress Enter to continue...")
+
+            # ── C — full uninstall ────────────────────────────────────────────
+            elif choice == "C":
+                print()
+                ColorOutput.print("FULL TURBOQUANT UNINSTALL", Colors.RED, bold=True)
+                print()
+                ColorOutput.print("This will:", Colors.WHITE)
+                print("  • Stop any running TurboQuant server")
+                print("  • Delete turboquant-config.json")
+                ColorOutput.print("  • Delete the HuggingFace model cache (~/.cache/huggingface)", Colors.RED)
+                ColorOutput.print("  • Uninstall turboquant and accelerate from the shared venv", Colors.RED)
+                print()
+                ColorOutput.warning("Everything TurboQuant-related will be removed!")
+                ColorOutput.print("  The shared venv itself is kept. Use [I] to reinstall later.", Colors.GRAY)
+                print()
+                confirm = input("Continue? (yes/no): ").strip().lower()
+                if confirm == "yes":
+                    print()
+                    self.full_uninstall()
+                else:
+                    ColorOutput.info("Cancelled.")
                 input("\nPress Enter to continue...")
 
             else:
