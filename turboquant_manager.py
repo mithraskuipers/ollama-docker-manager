@@ -21,57 +21,14 @@ import signal
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 
-from utils import Colors, ColorOutput, PlatformDetector, Platform, VenvManager
+from utils import Colors, ColorOutput, PlatformDetector, Platform, VenvManager, poll_http_health, kill_process_on_port
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Default / curated model list
+# Model list file  (mirrors ollama-models.json pattern)
 # ──────────────────────────────────────────────────────────────────────────────
 
-TURBOQUANT_SUGGESTED_MODELS: List[Dict] = [
-    {
-        "id": "Qwen/Qwen2.5-3B-Instruct",
-        "label": "Qwen 2.5 3B Instruct",
-        "bits": 4,
-        "description": "Fast 3B multilingual model. Great all-rounder for chat and code.",
-        "vram_gb": "~4 GB",
-    },
-    {
-        "id": "Qwen/Qwen2.5-7B-Instruct",
-        "label": "Qwen 2.5 7B Instruct",
-        "bits": 4,
-        "description": "Balanced 7B model. Strong reasoning and coding.",
-        "vram_gb": "~6 GB",
-    },
-    {
-        "id": "Qwen/Qwen2.5-14B-Instruct",
-        "label": "Qwen 2.5 14B Instruct",
-        "bits": 4,
-        "description": "Large 14B model. Excellent quality, needs ~10 GB VRAM.",
-        "vram_gb": "~10 GB",
-    },
-    {
-        "id": "mistralai/Mistral-7B-Instruct-v0.3",
-        "label": "Mistral 7B Instruct v0.3",
-        "bits": 4,
-        "description": "Classic open-weights model. Strong instruction following.",
-        "vram_gb": "~6 GB",
-    },
-    {
-        "id": "meta-llama/Llama-3.2-3B-Instruct",
-        "label": "Llama 3.2 3B Instruct",
-        "bits": 4,
-        "description": "Meta's compact Llama 3.2 model. Requires HF token.",
-        "vram_gb": "~4 GB",
-    },
-    {
-        "id": "google/gemma-2-2b-it",
-        "label": "Gemma 2 2B Instruct",
-        "bits": 4,
-        "description": "Google's lightweight Gemma 2. Requires HF token acceptance.",
-        "vram_gb": "~3 GB",
-    },
-]
+TURBOQUANT_MODELS_FILE = "turboquant-models.json"
 
 TURBOQUANT_CONFIG_FILE = "turboquant-config.json"
 
@@ -177,36 +134,26 @@ class TurboQuantManager:
             return False
 
     def install_turboquant(self) -> bool:
-        """Install turboquant into the shared venv (creates venv first if needed)."""
+        """Install turboquant + required deps into the shared venv (creates venv first if needed)."""
         ColorOutput.info(f"Installing turboquant into shared venv: {VenvManager.venv_dir()}")
         print()
         if not VenvManager.ensure(verbose=True):
             ColorOutput.error("Could not create shared venv.")
             return False
-        if not VenvManager.install("turboquant", verbose=True):
-            return False
+        # accelerate is required by turboquant for device_map support
+        for pkg in ("turboquant", "accelerate"):
+            ColorOutput.info(f"Installing {pkg}...")
+            if not VenvManager.install(pkg, verbose=True):
+                ColorOutput.error(f"Failed to install {pkg}.")
+                return False
         # Update this instance to use the venv python
         self.venv_python = VenvManager.python()
-        ColorOutput.success("turboquant installed into shared venv!")
+        ColorOutput.success("turboquant + accelerate installed into shared venv!")
         return True
 
     def _check_server_health(self, port: int, timeout: int = 30) -> bool:
-        """Poll /health until the server responds or timeout."""
-        try:
-            import urllib.request
-            url = f"http://localhost:{port}/health"
-            deadline = time.time() + timeout
-            while time.time() < deadline:
-                try:
-                    with urllib.request.urlopen(url, timeout=2) as resp:
-                        if resp.status == 200:
-                            return True
-                except Exception:
-                    pass
-                time.sleep(1)
-        except Exception:
-            pass
-        return False
+        """Poll /health until the server responds or timeout. Delegates to shared utility."""
+        return poll_http_health(f"http://localhost:{port}/health", timeout=timeout)
 
     # ── Server lifecycle ──────────────────────────────────────────────────────
 
@@ -231,6 +178,21 @@ class TurboQuantManager:
                 return False
 
         py = self.venv_python  # uses venv if installed there, else system python
+
+        # accelerate is required by transformers for device_map — auto-install if missing
+        try:
+            chk = subprocess.run([py, "-c", "import accelerate"], capture_output=True, timeout=10)
+            if chk.returncode != 0:
+                ColorOutput.warning("Missing dependency: accelerate — installing now...")
+                inst = subprocess.run([py, "-m", "pip", "install", "accelerate"], timeout=180)
+                if inst.returncode != 0:
+                    ColorOutput.error("Failed to install accelerate. Cannot start server.")
+                    return False
+                ColorOutput.success("accelerate installed successfully.")
+                print()
+        except Exception as dep_err:
+            ColorOutput.warning(f"Could not verify accelerate: {dep_err}")
+
         cmd = [
             py, "-m", "turboquant.server",
             "--model", model,
@@ -315,119 +277,190 @@ class TurboQuantManager:
         return True
 
     def kill_by_port(self, port: int) -> bool:
-        """Kill whatever process is listening on the given port (Linux/WSL only)."""
-        try:
-            r = subprocess.run(
-                ["fuser", "-k", f"{port}/tcp"],
-                capture_output=True, timeout=10
-            )
-            if r.returncode == 0:
-                ColorOutput.success(f"Killed process on port {port}.")
-                return True
-            else:
-                # Try lsof fallback
-                lsof = subprocess.run(
-                    ["lsof", "-ti", f":{port}"],
-                    capture_output=True, text=True, timeout=10
-                )
-                pid = lsof.stdout.strip()
-                if pid:
-                    subprocess.run(["kill", "-9", pid], timeout=5)
-                    ColorOutput.success(f"Killed PID {pid} on port {port}.")
-                    return True
-        except Exception as e:
-            ColorOutput.warning(f"Could not kill process on port {port}: {e}")
-        return False
+        """Kill whatever process is listening on port. Delegates to shared utility."""
+        result = kill_process_on_port(port)
+        if result:
+            ColorOutput.success(f"Killed process on port {port}.")
+        else:
+            ColorOutput.warning(f"No process found on port {port} (or could not kill it).")
+        return result
 
     # ── Quick test ────────────────────────────────────────────────────────────
 
     def test_server(self, port: int):
-        """Send a quick test prompt to the running server."""
+        """
+        Two-step test:
+          1. Health check  — GET /health
+          2. Chat ping     — POST /v1/chat/completions
+
+        turboquant uses Python's basic http.server which is single-threaded
+        and does NOT support HTTP keep-alive properly. Sending Connection: close
+        causes it to BrokenPipe on the *next* request. The correct approach is
+        to let the server manage the connection itself — open, read fully, done.
+        We use a fresh socket per request (requests does this automatically when
+        you don't reuse a Session across calls) and never send Connection: close.
+        """
         try:
-            import urllib.request
-            import json as _json
+            import requests as _req
+        except ImportError:
+            ColorOutput.error("'requests' library not found.")
+            ColorOutput.print("  Install with: pip install requests", Colors.CYAN)
+            return
 
-            payload = _json.dumps({
-                "model": self.config.get("model", "model"),
-                "messages": [{"role": "user", "content": "Say hello in one short sentence."}],
-                "max_tokens": 60,
-            }).encode()
+        model = self.config.get("model", "model")
+        base  = f"http://localhost:{port}"
 
-            req = urllib.request.Request(
-                f"http://localhost:{port}/v1/chat/completions",
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = _json.loads(resp.read())
-                msg = data["choices"][0]["message"]["content"]
-                print()
-                ColorOutput.success("Test response received:")
-                ColorOutput.print(f'  "{msg}"', Colors.WHITE)
+        # ── Step 1: health ────────────────────────────────────────────────────
+        print()
+        ColorOutput.info("Checking server health...")
+        try:
+            # (connect_timeout, read_timeout) — read up to 10 s for the body
+            hr = _req.get(f"{base}/health", timeout=(5, 10))
+            if hr.status_code == 200:
+                ColorOutput.success(f"Health endpoint OK  (HTTP {hr.status_code})")
+            else:
+                ColorOutput.warning(f"Health endpoint returned HTTP {hr.status_code}")
+        except _req.exceptions.ConnectionError:
+            ColorOutput.error("Cannot connect — is the server running?")
+            ColorOutput.print(f"  Try: curl {base}/health", Colors.CYAN)
+            return
+        except _req.exceptions.Timeout:
+            ColorOutput.error("Health check timed out — server may be busy loading the model.")
+            return
         except Exception as e:
-            ColorOutput.error(f"Test failed: {e}")
-            ColorOutput.print(
-                f"  Make sure server is running: curl http://localhost:{port}/health",
-                Colors.CYAN
+            ColorOutput.error(f"Health check failed: {e}")
+            return
+
+        # ── Step 2: chat ping ─────────────────────────────────────────────────
+        print()
+        ColorOutput.info(f"Sending test prompt to {model}...")
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": "Reply with exactly one sentence: Hello!"}],
+            "max_tokens": 60,
+        }
+        try:
+            # Do NOT reuse a Session and do NOT send Connection: close.
+            # turboquant's http.server handles one request per connection;
+            # a fresh request() call opens a fresh socket automatically.
+            resp = _req.post(
+                f"{base}/v1/chat/completions",
+                json=payload,
+                timeout=(5, 90),   # 5s connect, 90s read (model inference can be slow)
             )
+            if resp.status_code == 200:
+                data = resp.json()
+                msg  = data["choices"][0]["message"]["content"].strip()
+                print()
+                ColorOutput.success("Response received:")
+                ColorOutput.print(f'  "{msg}"', Colors.WHITE)
+            else:
+                ColorOutput.error(f"Chat ping failed  (HTTP {resp.status_code})")
+                ColorOutput.print(f"  Body: {resp.text[:300]}", Colors.GRAY)
+        except _req.exceptions.Timeout:
+            ColorOutput.error("Chat ping timed out — model may still be warming up, try again.")
+        except Exception as e:
+            ColorOutput.error(f"Chat ping failed: {e}")
 
     # ── Menu helpers ──────────────────────────────────────────────────────────
 
+    def _load_models_list(self) -> List[Dict]:
+        """
+        Load the curated model list from turboquant-models.json.
+        Falls back to an empty list if the file is missing or malformed —
+        the user can still enter a custom HuggingFace ID.
+        """
+        models_path = Path(TURBOQUANT_MODELS_FILE)
+        if not models_path.exists():
+            ColorOutput.warning(
+                f"Model list file not found: {TURBOQUANT_MODELS_FILE}"
+            )
+            ColorOutput.print(
+                "  Place turboquant-models.json next to this script to enable the model list.",
+                Colors.GRAY,
+            )
+            return []
+        try:
+            with open(models_path, "r") as fh:
+                data = json.load(fh)
+            return data.get("models", [])
+        except json.JSONDecodeError as exc:
+            ColorOutput.error(f"Could not parse {TURBOQUANT_MODELS_FILE}: {exc}")
+            return []
+        except Exception as exc:
+            ColorOutput.error(f"Could not read {TURBOQUANT_MODELS_FILE}: {exc}")
+            return []
+
     def _pick_model(self) -> Tuple[str, int]:
         """
-        Interactive model picker.
-        Returns (model_id, bits).
+        Interactive model picker.  Reads from turboquant-models.json —
+        the same pattern as ollama-models.json / menu_handler.install_model().
+        Returns (model_id, bits) or ("", 0) on cancel.
         """
+        import textwrap
+
+        model_list = self._load_models_list()
+
         print()
-        ColorOutput.print("SELECT MODEL", Colors.CYAN, bold=True)
+        ColorOutput.print("SELECT TURBOQUANT MODEL", Colors.CYAN, bold=True)
         print()
-        for i, m in enumerate(TURBOQUANT_SUGGESTED_MODELS, 1):
-            vram = m["vram_gb"]
-            label = m["label"]
-            desc = m["description"]
-            ColorOutput.print(f"  [{i}] {label}", Colors.WHITE)
-            ColorOutput.print(f"      {desc}", Colors.GRAY)
-            ColorOutput.print(f"      VRAM: {vram}  |  Default: {m['bits']}-bit", Colors.GRAY)
+
+        if model_list:
+            for i, m in enumerate(model_list, 1):
+                label   = m.get("label") or m.get("id", "Unknown")
+                hf_id   = m.get("id", "")
+                desc    = m.get("description", "")
+                vram    = m.get("vram_gb", "?")
+                bits    = m.get("bits", 4)
+
+                ColorOutput.print(f"  [{i}] {label}", Colors.WHITE, bold=True)
+                ColorOutput.print(f"      {hf_id}", Colors.GRAY)
+                if desc:
+                    wrapped = textwrap.fill(
+                        desc, width=70,
+                        initial_indent="      ",
+                        subsequent_indent="      ",
+                    )
+                    ColorOutput.print(wrapped, Colors.GRAY)
+                ColorOutput.print(
+                    f"      VRAM: {vram}  |  Default quantization: {bits}-bit",
+                    Colors.GRAY,
+                )
+                print()
+        else:
+            ColorOutput.print(
+                "  No models in list — enter a custom HuggingFace ID below.",
+                Colors.YELLOW,
+            )
             print()
-        print(f"  [C] Enter a custom HuggingFace model ID")
-        print(f"  [0] Cancel")
+
+        ColorOutput.print("─" * 60, Colors.GRAY)
+        print()
+        print("  [C] Enter a custom HuggingFace model ID")
+        print("  [0] Cancel")
         print()
 
         choice = input("Select model: ").strip().upper()
+
         if choice == "0":
             return "", 0
-        if choice == "C":
-            model_id = input("Enter HuggingFace model ID (e.g. Qwen/Qwen2.5-7B-Instruct): ").strip()
+
+        if choice == "C" or (not model_list and choice != "0"):
+            model_id = input(
+                "HuggingFace model ID (e.g. Qwen/Qwen2.5-7B-Instruct): "
+            ).strip()
             if not model_id:
                 ColorOutput.warning("No model ID entered.")
                 return "", 0
-            bits_str = input("Quantization bits [4] / 8: ").strip() or "4"
-            try:
-                bits = int(bits_str)
-                if bits not in (4, 8):
-                    raise ValueError
-            except ValueError:
-                ColorOutput.warning("Invalid bits value, defaulting to 4.")
-                bits = 4
+            bits = self._ask_bits(4)
             return model_id, bits
 
         try:
             idx = int(choice) - 1
-            if 0 <= idx < len(TURBOQUANT_SUGGESTED_MODELS):
-                m = TURBOQUANT_SUGGESTED_MODELS[idx]
-                # Allow overriding bits
-                default_bits = m["bits"]
-                bits_ans = input(
-                    f"Quantization bits [{default_bits}] / {'8' if default_bits == 4 else '4'}: "
-                ).strip() or str(default_bits)
-                try:
-                    bits = int(bits_ans)
-                    if bits not in (4, 8):
-                        raise ValueError
-                except ValueError:
-                    ColorOutput.warning("Invalid bits value, using default.")
-                    bits = default_bits
+            if 0 <= idx < len(model_list):
+                m            = model_list[idx]
+                default_bits = m.get("bits", 4)
+                bits         = self._ask_bits(default_bits)
                 return m["id"], bits
         except (ValueError, IndexError):
             pass
@@ -435,197 +468,214 @@ class TurboQuantManager:
         ColorOutput.error("Invalid selection.")
         return "", 0
 
+    def _ask_bits(self, default: int = 4) -> int:
+        """Prompt for quantization bits (4 or 8), returning the default on invalid input."""
+        other = 8 if default == 4 else 4
+        raw = input(f"Quantization bits [{default}] / {other}: ").strip()
+        if not raw:
+            return default
+        try:
+            bits = int(raw)
+            if bits not in (4, 8):
+                raise ValueError
+            return bits
+        except ValueError:
+            ColorOutput.warning(f"Invalid value — using {default}-bit.")
+            return default
+
     # ── Main menu ─────────────────────────────────────────────────────────────
 
     def show_menu(self):
         """
         Interactive TurboQuant sub-menu.
-        Called from OllamaManager.
+        Called from OllamaManager when the user selects [T].
+
+        ⚠  TurboQuant uses HuggingFace Transformers and downloads its own
+           model weights from huggingface.co.  These are DIFFERENT files from
+           the GGUF models used by Ollama — both can coexist on the same machine.
         """
         while True:
             os.system("cls" if os.name == "nt" else "clear")
 
-            print()
-            ColorOutput.print("=" * 60, Colors.MAGENTA, bold=True)
-            ColorOutput.print("   ⚡ TURBOQUANT INFERENCE SERVER", Colors.MAGENTA, bold=True)
-            ColorOutput.print("=" * 60, Colors.MAGENTA, bold=True)
-            print()
-
-            # Status
             installed = self.is_turboquant_installed()
-            running = self.is_server_running()
+            running   = self.is_server_running()
+            model     = self.config.get("model", "—")
+            bits      = self.config.get("bits", 4)
+            port      = self.config.get("port", 8000)
+            hf_token  = self.config.get("hf_token", "")
 
-            if installed:
-                ColorOutput.print("  Installation : ", Colors.GRAY, end="")
-                ColorOutput.print("INSTALLED", Colors.GREEN)
-            else:
-                ColorOutput.print("  Installation : ", Colors.GRAY, end="")
-                ColorOutput.print("NOT INSTALLED", Colors.RED)
+            # ── Header ───────────────────────────────────────────────────────
+            ColorOutput.print("=" * 60, Colors.MAGENTA, bold=True)
+            ColorOutput.print("   ⚡ TURBOQUANT  —  GPU Quantized Inference", Colors.MAGENTA, bold=True)
+            ColorOutput.print("=" * 60, Colors.MAGENTA, bold=True)
+            print()
 
-            ColorOutput.print("  Server       : ", Colors.GRAY, end="")
+            # ── Status panel ─────────────────────────────────────────────────
+            inst_str  = f"{Colors.GREEN}INSTALLED{Colors.RESET}"   if installed else f"{Colors.RED}NOT INSTALLED{Colors.RESET}"
+            srv_str   = f"{Colors.GREEN}RUNNING{Colors.RESET}"     if running   else f"{Colors.YELLOW}STOPPED{Colors.RESET}"
+            token_str = f"{Colors.GREEN}set{Colors.RESET}" if hf_token else f"{Colors.GRAY}not set{Colors.RESET}"
+
+            print(f"  Package  : {inst_str}")
+            print(f"  Server   : {srv_str}")
             if running:
-                ColorOutput.print("RUNNING", Colors.GREEN)
-                ColorOutput.print(
-                    f"  Endpoint     : http://localhost:{self.config['port']}/v1",
-                    Colors.CYAN
-                )
-            else:
-                ColorOutput.print("STOPPED", Colors.YELLOW)
+                ColorOutput.print(f"  Endpoint : http://localhost:{port}/v1", Colors.CYAN)
+            print(f"  Model    : {Colors.WHITE}{model}{Colors.RESET}  ({bits}-bit)")
+            print(f"  Port     : {port}")
+            print(f"  HF Token : {token_str}")
+            print()
 
-            ColorOutput.print(f"  Last model   : {self.config.get('model', '—')}", Colors.GRAY)
-            ColorOutput.print(
-                f"  Quant bits   : {self.config.get('bits', 4)}-bit", Colors.GRAY
-            )
-            ColorOutput.print(f"  Port         : {self.config.get('port', 8000)}", Colors.GRAY)
-
+            # ── Important note about model storage ───────────────────────────
+            ColorOutput.print("  ℹ  TurboQuant downloads its own HuggingFace model weights.", Colors.YELLOW)
+            ColorOutput.print("     These are separate from your Ollama/GGUF models.", Colors.GRAY)
+            ColorOutput.print("     First launch will download the model (~2–15 GB).", Colors.GRAY)
             print()
             ColorOutput.print("─" * 60, Colors.GRAY)
             print()
 
-            ColorOutput.print("SETUP:", Colors.CYAN, bold=True)
-            print("  [I] Install TurboQuant (pip)")
-            print()
+            # ── Menu items — context-sensitive ───────────────────────────────
+            if not installed:
+                ColorOutput.print("  SETUP  (required before first use)", Colors.CYAN, bold=True)
+                print("    [I] Install TurboQuant  (pip install turboquant accelerate)")
+                print()
+            else:
+                ColorOutput.print("  SERVER", Colors.CYAN, bold=True)
+                if not running:
+                    print("    [1] Start Server      (launches inference on the configured model)")
+                    print("    [2] Start with a different model")
+                else:
+                    print("    [3] Stop Server")
+                    print("    [4] Force-kill server on port  (if Stop doesn't work)")
+                print()
 
-            ColorOutput.print("SERVER:", Colors.CYAN, bold=True)
-            print("  [1] Start TurboQuant Server")
-            print("  [2] Stop TurboQuant Server")
-            print("  [3] Kill server on port (force)")
-            print()
+                ColorOutput.print("  TEST & INSPECT", Colors.CYAN, bold=True)
+                print("    [5] Send a test message  (quick health + chat ping)")
+                print("    [6] Show API endpoints & curl examples")
+                print()
 
-            ColorOutput.print("USAGE:", Colors.CYAN, bold=True)
-            print("  [4] Test server (quick chat ping)")
-            print("  [5] Show API info & example curl commands")
-            print()
+                ColorOutput.print("  CONFIGURE", Colors.CYAN, bold=True)
+                print("    [7] Change model, quantization bits, or port")
+                print("    [8] Set HuggingFace token  (required for Llama, Gemma, etc.)")
+                print()
 
-            ColorOutput.print("CONFIG:", Colors.CYAN, bold=True)
-            print("  [6] Change model / bits / port")
-            print("  [7] Set HuggingFace token (for gated models)")
-            print()
+                ColorOutput.print("  SETUP", Colors.CYAN, bold=True)
+                print("    [I] Re-install / upgrade TurboQuant")
+                print()
 
-            print("  [0] Back to main menu")
+            print("    [0] Back to main menu")
             print()
             ColorOutput.print("─" * 60, Colors.GRAY)
             print()
 
             choice = input("Select option: ").strip().upper()
 
+            # ── 0 — back ─────────────────────────────────────────────────────
             if choice == "0":
                 break
 
+            # ── I — install ──────────────────────────────────────────────────
             elif choice == "I":
                 print()
                 if installed:
                     ColorOutput.success("TurboQuant is already installed.")
                     ans = input("Re-install / upgrade? (y/n): ").strip().lower()
                     if ans != "y":
-                        input("\nPress Enter to continue...")
                         continue
                 self.install_turboquant()
                 input("\nPress Enter to continue...")
 
-            elif choice == "1":
+            # ── 1 — start with saved config ──────────────────────────────────
+            elif choice == "1" and installed and not running:
+                if not model or model == "—":
+                    ColorOutput.warning("No model configured yet. Use [2] to pick one first.")
+                    input("\nPress Enter to continue...")
+                    continue
                 print()
-                model = self.config.get("model", "")
-                bits = self.config.get("bits", 4)
-                port = self.config.get("port", 8000)
-                hf_token = self.config.get("hf_token", "")
-
+                ColorOutput.print(f"Starting: {model}  ({bits}-bit)  on port {port}", Colors.CYAN)
                 print()
-                ColorOutput.print("Use saved config or pick a new model?", Colors.CYAN)
-                if model:
-                    ColorOutput.print(f"  Saved: {model} ({bits}-bit, port {port})", Colors.GRAY)
-                print("  [1] Use saved config")
-                print("  [2] Pick a different model")
-                print()
-                sub = input("Choice [1]: ").strip() or "1"
-
-                if sub == "2":
-                    model, bits = self._pick_model()
-                    if not model:
-                        input("\nPress Enter to continue...")
-                        continue
-                    port_str = input(f"Port [{port}]: ").strip() or str(port)
-                    try:
-                        port = int(port_str)
-                    except ValueError:
-                        port = self.config.get("port", 8000)
-
-                if model:
-                    print()
-                    self.start_server(model, bits, port, hf_token)
+                self.start_server(model, bits, port, hf_token)
                 input("\nPress Enter to continue...")
 
-            elif choice == "2":
+            # ── 2 — pick a different model then start ─────────────────────────
+            elif choice == "2" and installed and not running:
                 print()
-                self.stop_server()
-                input("\nPress Enter to continue...")
-
-            elif choice == "3":
-                print()
-                port_str = input(
-                    f"Port to kill [{self.config.get('port', 8000)}]: "
-                ).strip() or str(self.config.get("port", 8000))
+                new_model, new_bits = self._pick_model()
+                if not new_model:
+                    continue
+                port_str = input(f"Port [{port}]: ").strip() or str(port)
                 try:
                     port = int(port_str)
                 except ValueError:
                     port = self.config.get("port", 8000)
-                self.kill_by_port(port)
-                input("\nPress Enter to continue...")
-
-            elif choice == "4":
                 print()
-                port = self.config.get("port", 8000)
-                self.test_server(port)
+                self.start_server(new_model, new_bits, port, hf_token)
                 input("\nPress Enter to continue...")
 
-            elif choice == "5":
+            # ── 3 — stop ─────────────────────────────────────────────────────
+            elif choice == "3" and installed and running:
+                print()
+                self.stop_server()
+                input("\nPress Enter to continue...")
+
+            # ── 4 — force kill ────────────────────────────────────────────────
+            elif choice == "4" and installed and running:
+                print()
+                self.kill_by_port(port)
+                self._server_proc = None
+                input("\nPress Enter to continue...")
+
+            # ── 5 — test ─────────────────────────────────────────────────────
+            elif choice == "5" and installed:
+                print()
+                if not running:
+                    ColorOutput.warning("Server is not running. Start it first with [1] or [2].")
+                else:
+                    self.test_server(port)
+                input("\nPress Enter to continue...")
+
+            # ── 6 — API info ─────────────────────────────────────────────────
+            elif choice == "6" and installed:
                 self._show_api_info()
                 input("\nPress Enter to continue...")
 
-            elif choice == "6":
+            # ── 7 — change config ─────────────────────────────────────────────
+            elif choice == "7" and installed:
                 print()
-                model, bits = self._pick_model()
-                if model:
+                new_model, new_bits = self._pick_model()
+                if new_model:
                     port_str = input(
                         f"Port [{self.config.get('port', 8000)}]: "
                     ).strip() or str(self.config.get("port", 8000))
                     try:
-                        port = int(port_str)
+                        new_port = int(port_str)
                     except ValueError:
-                        port = self.config.get("port", 8000)
-                    self.config["model"] = model
-                    self.config["bits"] = bits
-                    self.config["port"] = port
+                        new_port = self.config.get("port", 8000)
+                    self.config["model"] = new_model
+                    self.config["bits"]  = new_bits
+                    self.config["port"]  = new_port
                     self._save_config()
                     print()
                     ColorOutput.success("Configuration saved.")
+                    if running:
+                        ColorOutput.warning("Server is running with the old model. Restart it to apply changes.")
                 input("\nPress Enter to continue...")
 
-            elif choice == "7":
+            # ── 8 — HF token ─────────────────────────────────────────────────
+            elif choice == "8" and installed:
                 print()
-                ColorOutput.print(
-                    "HuggingFace token is needed for gated models (Llama, Gemma, etc.)",
-                    Colors.CYAN
-                )
-                ColorOutput.print(
-                    "Get yours at: https://huggingface.co/settings/tokens",
-                    Colors.GRAY
-                )
+                ColorOutput.print("HuggingFace token — required for gated models (Llama, Gemma, Mistral…)", Colors.CYAN)
+                ColorOutput.print("Get yours at: https://huggingface.co/settings/tokens", Colors.GRAY)
                 print()
-                current = self.config.get("hf_token", "")
-                if current:
-                    ColorOutput.print(f"  Current token: {current[:8]}...(hidden)", Colors.GRAY)
-                token = input("Enter HuggingFace token (leave blank to clear): ").strip()
+                if hf_token:
+                    ColorOutput.print(f"  Current token: {hf_token[:8]}••••••••  (hidden)", Colors.GRAY)
+                token = input("Enter token (leave blank to clear): ").strip()
                 self.config["hf_token"] = token
                 self._save_config()
-                if token:
-                    ColorOutput.success("Token saved.")
-                else:
-                    ColorOutput.info("Token cleared.")
+                print()
+                ColorOutput.success("Token saved.") if token else ColorOutput.info("Token cleared.")
                 input("\nPress Enter to continue...")
 
             else:
-                ColorOutput.error("Invalid option.")
+                ColorOutput.error("Invalid option or action not available in current state.")
                 input("\nPress Enter to continue...")
 
     def _show_api_info(self):

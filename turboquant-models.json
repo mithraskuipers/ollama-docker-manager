@@ -1,0 +1,144 @@
+{
+  "models": [
+    {
+      "id": "Qwen/Qwen2.5-0.5B-Instruct",
+      "label": "Qwen 2.5 0.5B Instruct",
+      "bits": 4,
+      "vram_gb": "~1 GB",
+      "description": "Ultra-lightweight 0.5B model. Extremely fast on any GPU or even CPU. Good for quick tests and edge devices."
+    },
+    {
+      "id": "Qwen/Qwen2.5-1.5B-Instruct",
+      "label": "Qwen 2.5 1.5B Instruct",
+      "bits": 4,
+      "vram_gb": "~2 GB",
+      "description": "Tiny but surprisingly capable. Great for low-VRAM systems and rapid iteration."
+    },
+    {
+      "id": "Qwen/Qwen2.5-3B-Instruct",
+      "label": "Qwen 2.5 3B Instruct",
+      "bits": 4,
+      "vram_gb": "~3 GB",
+      "description": "Fast 3B multilingual model. Excellent all-rounder for chat, code, and general tasks."
+    },
+    {
+      "id": "Qwen/Qwen2.5-7B-Instruct",
+      "label": "Qwen 2.5 7B Instruct",
+      "bits": 4,
+      "vram_gb": "~5 GB",
+      "description": "Balanced 7B model. Strong reasoning, coding, and multilingual support. Best value for most users."
+    },
+    {
+      "id": "Qwen/Qwen2.5-14B-Instruct",
+      "label": "Qwen 2.5 14B Instruct",
+      "bits": 4,
+      "vram_gb": "~9 GB",
+      "description": "Large 14B model. Excellent quality across all tasks. Needs a mid-range or better GPU."
+    },
+    {
+      "id": "Qwen/Qwen2.5-Coder-7B-Instruct",
+      "label": "Qwen 2.5 Coder 7B",
+      "bits": 4,
+      "vram_gb": "~5 GB",
+      "description": "Specialized coding model. Excellent at code generation, review, and debugging across 40+ languages."
+    },
+    {
+      "id": "Qwen/Qwen2.5-Coder-14B-Instruct",
+      "label": "Qwen 2.5 Coder 14B",
+      "bits": 4,
+      "vram_gb": "~9 GB",
+      "description": "Top-tier open-source coding model. Near GPT-4 level code quality for most tasks."
+    },
+    {
+      "id": "mistralai/Mistral-7B-Instruct-v0.3",
+      "label": "Mistral 7B Instruct v0.3",
+      "bits": 4,
+      "vram_gb": "~5 GB",
+      "description": "Classic open-weights model from Mistral AI. Strong instruction following and general reasoning."
+    },
+    {
+      "id": "mistralai/Mistral-Nemo-Instruct-2407",
+      "label": "Mistral Nemo 12B Instruct",
+      "bits": 4,
+      "vram_gb": "~8 GB",
+      "description": "Mistral's 12B model with a large 128k context window. Great for long documents and complex tasks."
+    },
+    {
+      "id": "microsoft/Phi-3.5-mini-instruct",
+      "label": "Phi 3.5 Mini Instruct (3.8B)",
+      "bits": 4,
+      "vram_gb": "~3 GB",
+      "description": "Microsoft's efficient 3.8B model. Punches well above its weight for reasoning and coding tasks."
+    },
+    {
+      "id": "microsoft/Phi-3-medium-4k-instruct",
+      "label": "Phi 3 Medium Instruct (14B)",
+      "bits": 4,
+      "vram_gb": "~9 GB",
+      "description": "Microsoft's 14B model. Very strong reasoning and STEM performance relative to its size."
+    },
+    {
+      "id": "google/gemma-2-2b-it",
+      "label": "Gemma 2 2B Instruct",
+      "bits": 4,
+      "vram_gb": "~2 GB",
+      "description": "Google's compact Gemma 2. Efficient and capable for its size. Requires HF token acceptance on huggingface.co."
+    },
+    {
+      "id": "google/gemma-2-9b-it",
+      "label": "Gemma 2 9B Instruct",
+      "bits": 4,
+      "vram_gb": "~6 GB",
+      "description": "Google's mid-size Gemma 2. Strong across reasoning, math, and code. Requires HF token acceptance."
+    },
+    {
+      "id": "meta-llama/Llama-3.2-1B-Instruct",
+      "label": "Llama 3.2 1B Instruct",
+      "bits": 4,
+      "vram_gb": "~1 GB",
+      "description": "Meta's smallest Llama 3.2. Surprisingly capable for a 1B model. Requires HF token."
+    },
+    {
+      "id": "meta-llama/Llama-3.2-3B-Instruct",
+      "label": "Llama 3.2 3B Instruct",
+      "bits": 4,
+      "vram_gb": "~3 GB",
+      "description": "Meta's compact Llama 3.2. Good general-purpose chat and reasoning. Requires HF token."
+    },
+    {
+      "id": "meta-llama/Llama-3.1-8B-Instruct",
+      "label": "Llama 3.1 8B Instruct",
+      "bits": 4,
+      "vram_gb": "~6 GB",
+      "description": "Meta's 8B Llama 3.1 with 128k context. One of the best open 8B models available. Requires HF token."
+    },
+    {
+      "id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+      "label": "DeepSeek R1 Distill 1.5B",
+      "bits": 4,
+      "vram_gb": "~2 GB",
+      "description": "Tiny reasoning model distilled from DeepSeek R1. Shows chain-of-thought reasoning at a fraction of the cost."
+    },
+    {
+      "id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+      "label": "DeepSeek R1 Distill 7B",
+      "bits": 4,
+      "vram_gb": "~5 GB",
+      "description": "7B reasoning model distilled from DeepSeek R1. Excellent math and logical reasoning performance."
+    },
+    {
+      "id": "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+      "label": "DeepSeek R1 Distill Llama 8B",
+      "bits": 4,
+      "vram_gb": "~6 GB",
+      "description": "8B reasoning model on a Llama backbone. Strong STEM and logical reasoning with chain-of-thought output."
+    },
+    {
+      "id": "HuggingFaceTB/SmolLM2-1.7B-Instruct",
+      "label": "SmolLM2 1.7B Instruct",
+      "bits": 4,
+      "vram_gb": "~2 GB",
+      "description": "HuggingFace's efficient 1.7B model. Designed to run well on-device with surprisingly good quality."
+    }
+  ]
+}

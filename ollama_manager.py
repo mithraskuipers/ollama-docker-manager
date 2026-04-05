@@ -144,6 +144,19 @@ class OllamaManager:
         print()
 
         # ── USE ──────────────────────────────────────────────────────────────
+        tq_running   = self.turboquant.is_server_running()
+        tq_installed = self.turboquant.is_turboquant_installed()
+        if tq_running:
+            tq_label = (
+                f"{Colors.GREEN}RUNNING"
+                f" — port {self.turboquant.config.get('port', 8000)}"
+                f" — {self.turboquant.config.get('model', '?')}{Colors.RESET}"
+            )
+        elif tq_installed:
+            tq_label = f"{Colors.YELLOW}stopped{Colors.RESET}"
+        else:
+            tq_label = f"{Colors.GRAY}not installed{Colors.RESET}"
+
         ColorOutput.print("  USE", Colors.CYAN, bold=True)
         print("    [6] Chat with Model")
         print("    [7] API Info & Network Access")
@@ -152,20 +165,8 @@ class OllamaManager:
         print()
 
         # ── TURBOQUANT ───────────────────────────────────────────────────────
-        tq_running   = self.turboquant.is_server_running()
-        tq_installed = self.turboquant.is_turboquant_installed()
-        if tq_running:
-            tq_status = (
-                f"{Colors.GREEN}RUNNING{Colors.RESET}"
-                f" — port {self.turboquant.config.get('port', 8000)}"
-            )
-        elif tq_installed:
-            tq_status = f"{Colors.YELLOW}installed / stopped{Colors.RESET}"
-        else:
-            tq_status = f"{Colors.GRAY}not installed{Colors.RESET}"
-
-        ColorOutput.print("  TURBOQUANT  (GPU Quantized Inference)", Colors.MAGENTA, bold=True)
-        print(f"    [T] TurboQuant Server Manager  ({tq_status})")
+        ColorOutput.print("  TURBOQUANT  (HuggingFace / GPU Quantized Inference)", Colors.MAGENTA, bold=True)
+        print(f"    [T] TurboQuant Server Manager  ({tq_label})")
         print()
 
         # ── ADVANCED ─────────────────────────────────────────────────────────

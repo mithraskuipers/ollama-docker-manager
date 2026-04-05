@@ -597,6 +597,58 @@ class VenvManager:
             if verbose:
                 ColorOutput.error(f"Installation error: {e}")
             return False
-        if verbose:
-            ColorOutput.success(f"{package} installed.")
-        return True
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Shared network utilities
+# Used by both DockerManager (Ollama) and TurboQuantManager.
+# ──────────────────────────────────────────────────────────────────────────────
+
+import time as _time
+
+
+def poll_http_health(url: str, timeout: int = 60) -> bool:
+    """
+    Poll *url* every second until it returns HTTP 200 or *timeout* seconds pass.
+
+    Returns True if the endpoint responded with 200, False on timeout.
+    Works with any plain HTTP endpoint — no third-party libraries required.
+    """
+    import urllib.request as _req
+    deadline = _time.time() + timeout
+    while _time.time() < deadline:
+        try:
+            with _req.urlopen(url, timeout=2) as resp:
+                if resp.status == 200:
+                    return True
+        except Exception:
+            pass
+        _time.sleep(1)
+    return False
+
+
+def kill_process_on_port(port: int) -> bool:
+    """
+    Kill whatever process is listening on *port* (Linux / WSL / macOS).
+
+    Tries ``fuser -k`` first, then falls back to ``lsof``+``kill -9``.
+    Returns True if a process was found and killed.
+    """
+    import subprocess as _sp
+    # fuser is the fastest option
+    try:
+        r = _sp.run(["fuser", "-k", f"{port}/tcp"], capture_output=True, timeout=10)
+        if r.returncode == 0:
+            return True
+    except Exception:
+        pass
+    # lsof fallback
+    try:
+        lsof = _sp.run(["lsof", "-ti", f":{port}"], capture_output=True, text=True, timeout=10)
+        pid = lsof.stdout.strip()
+        if pid:
+            _sp.run(["kill", "-9", pid], timeout=5)
+            return True
+    except Exception:
+        pass
+    return False
