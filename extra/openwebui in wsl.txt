@@ -1,0 +1,23 @@
+docker run -d \
+  -p 3000:8080 \
+  --name open-webui \
+  -v open-webui:/app/backend/data \
+  -e OPENAI_API_BASE_URL=http://host.docker.internal:8000/v1 \
+  -e OPENAI_API_KEY=dummy \
+  --restart always \
+  ghcr.io/open-webui/open-webui:main
+
+
+
+
+
+localhost:3000
+
+
+OLLAMA API:
+
+Ollama:
+http://host.docker.internal:11434
+
+TurboQuant:
+http://host.docker.internal:8000

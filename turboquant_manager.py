@@ -40,6 +40,290 @@ TURBOQUANT_CONFIG_FILE = "turboquant-config.json"
 # Config dataclass (plain dict saved as JSON)
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Patched server script written to venv dir at start_server() time.
+# Fixes stock turboquant 0.2.0 server.py issues:
+#   1. BrokenPipeError spam (HTTP/1.0 + Connection: close fix)
+#   2. Missing /v1/models endpoint needed by Open WebUI
+#   3. No BrokenPipeError handling in _send_json / do_POST
+PATCHED_SERVER_SCRIPT = '''"""
+TurboQuant Inference Server — patched for Open WebUI / keep-alive compatibility.
+
+Changes vs stock turboquant 0.2.0:
+  - _send_json wraps wfile.write in try/except BrokenPipeError (silent drop)
+  - Connection: close header added to every response so clients don't hang
+  - /v1/models endpoint added (Open WebUI probes this on startup)
+  - /v1/models route added to do_GET
+  - do_OPTIONS sends Connection: close
+  - Unrecognised GET paths return 404 cleanly instead of crashing
+
+Everything else (model loading, generate_response, TurboQuantCache) is unchanged.
+"""
+
+import torch
+import json
+import time
+import argparse
+import asyncio
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from threading import Thread
+from typing import Optional
+from dataclasses import dataclass
+
+from turboquant.cache import TurboQuantCache
+
+_model = None
+_tokenizer = None
+_model_name = ""
+_tq_bits = 3
+_device = "cuda"
+
+
+def load_model(model_name: str, quantize: Optional[str] = None):
+    global _model, _tokenizer, _model_name
+
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    print(f"Loading {model_name}...")
+    _tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+
+    load_kwargs = {
+        "trust_remote_code": True,
+        "device_map": "auto",
+    }
+
+    if quantize == "int8":
+        load_kwargs["load_in_8bit"] = True
+        print("  Using INT8 weight quantization (bitsandbytes)")
+    elif quantize == "int4":
+        load_kwargs["load_in_4bit"] = True
+        print("  Using INT4 weight quantization (bitsandbytes)")
+    else:
+        load_kwargs["dtype"] = torch.float16
+
+    _model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+    _model_name = model_name
+
+    vram = torch.cuda.memory_allocated() / 1024 / 1024 if torch.cuda.is_available() else 0
+    print(f"  Loaded. VRAM: {vram:.0f} MB")
+
+
+def generate_response(messages: list, max_tokens: int = 512, temperature: float = 0.7,
+                       tools: Optional[list] = None, stream: bool = False) -> dict:
+    global _model, _tokenizer, _tq_bits
+
+    text = _tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = _tokenizer(text, return_tensors="pt", truncation=True, max_length=4096).to(_model.device)
+    input_len = inputs["input_ids"].shape[1]
+
+    cache = TurboQuantCache(bits=_tq_bits)
+
+    t0 = time.perf_counter()
+
+    with torch.no_grad():
+        outputs = _model(**inputs, use_cache=True, past_key_values=cache)
+        past = outputs.past_key_values
+
+        generated_ids = []
+        next_logits = outputs.logits[:, -1, :]
+
+        if temperature > 0 and temperature != 1.0:
+            next_logits = next_logits / temperature
+
+        next_token = next_logits.argmax(dim=-1, keepdim=True)
+        generated_ids.append(next_token.item())
+
+        for _ in range(max_tokens - 1):
+            outputs = _model(
+                input_ids=next_token,
+                past_key_values=past,
+                use_cache=True,
+            )
+            past = outputs.past_key_values
+            next_logits = outputs.logits[:, -1, :]
+
+            if temperature > 0 and temperature != 1.0:
+                next_logits = next_logits / temperature
+
+            next_token = next_logits.argmax(dim=-1, keepdim=True)
+            token_id = next_token.item()
+            generated_ids.append(token_id)
+
+            if token_id == _tokenizer.eos_token_id:
+                break
+
+    duration = time.perf_counter() - t0
+    output_text = _tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+    return {
+        "id": f"chatcmpl-tq-{int(time.time()*1000)}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": _model_name,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": output_text,
+            },
+            "finish_reason": "stop" if generated_ids[-1] == _tokenizer.eos_token_id else "length",
+        }],
+        "usage": {
+            "prompt_tokens": input_len,
+            "completion_tokens": len(generated_ids),
+            "total_tokens": input_len + len(generated_ids),
+        },
+        "turboquant": {
+            "kv_bits": _tq_bits,
+            "generation_time_s": round(duration, 3),
+            "tokens_per_sec": round(len(generated_ids) / duration, 1) if duration > 0 else 0,
+            "vram_mb": round(torch.cuda.memory_allocated() / 1024 / 1024) if torch.cuda.is_available() else 0,
+        },
+    }
+
+
+class TurboQuantHandler(BaseHTTPRequestHandler):
+
+    # Force HTTP/1.0 so clients never expect keep-alive
+    protocol_version = "HTTP/1.0"
+
+    def log_message(self, fmt, *args):
+        pass  # suppress noisy per-request logs
+
+    def _send_json(self, data: dict, status: int = 200):
+        try:
+            body = json.dumps(data).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+            self.wfile.flush()
+        except BrokenPipeError:
+            pass  # client disconnected before we finished — harmless
+        except Exception:
+            pass
+
+    def do_OPTIONS(self):
+        try:
+            self.send_response(200)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+            self.send_header("Connection", "close")
+            self.end_headers()
+        except BrokenPipeError:
+            pass
+
+    def do_GET(self):
+        path = self.path.split("?")[0]  # strip query string
+
+        if path == "/health":
+            gpu_info = {}
+            if torch.cuda.is_available():
+                gpu_info = {
+                    "gpu": torch.cuda.get_device_name(0),
+                    "vram_used_mb": round(torch.cuda.memory_allocated() / 1024 / 1024),
+                    "vram_total_mb": round(torch.cuda.get_device_properties(0).total_memory / 1024 / 1024),
+                }
+            self._send_json({
+                "status": "ok",
+                "model": _model_name,
+                "kv_bits": _tq_bits,
+                **gpu_info,
+            })
+
+        elif path in ("/v1/models", "/api/models"):
+            # Open WebUI probes /v1/models to discover available models
+            self._send_json({
+                "object": "list",
+                "data": [{
+                    "id": _model_name,
+                    "object": "model",
+                    "created": int(time.time()),
+                    "owned_by": "turboquant",
+                }],
+            })
+
+        else:
+            self._send_json({"error": "not found"}, 404)
+
+    def do_POST(self):
+        path = self.path.split("?")[0]
+
+        if path != "/v1/chat/completions":
+            self._send_json({"error": "not found"}, 404)
+            return
+
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(content_length))
+        except Exception as e:
+            self._send_json({"error": f"bad request: {e}"}, 400)
+            return
+
+        messages = body.get("messages", [])
+        max_tokens = body.get("max_tokens", 512)
+        temperature = body.get("temperature", 0.7)
+        tools = body.get("tools")
+        stream = body.get("stream", False)
+
+        if not messages:
+            self._send_json({"error": "messages required"}, 400)
+            return
+
+        try:
+            t0 = time.perf_counter()
+            result = generate_response(messages, max_tokens, temperature, tools, stream)
+            elapsed = time.perf_counter() - t0
+            tps = result['turboquant']['tokens_per_sec']
+            tok = result['usage']['completion_tokens']
+            print(f"  [{tok} tok, {elapsed:.1f}s, {tps} tok/s]", flush=True)
+            self._send_json(result)
+        except BrokenPipeError:
+            pass
+        except Exception as e:
+            print(f"  ERROR: {e}", flush=True)
+            self._send_json({"error": str(e)}, 500)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="TurboQuant Inference Server")
+    parser.add_argument("--model", default="Qwen/Qwen2.5-3B-Instruct")
+    parser.add_argument("--bits", type=int, default=4)
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--quantize", choices=["none", "int8", "int4"], default="none")
+    args = parser.parse_args()
+
+    global _tq_bits
+    _tq_bits = args.bits
+
+    load_model(args.model, quantize=args.quantize if args.quantize != "none" else None)
+
+    server = HTTPServer(("0.0.0.0", args.port), TurboQuantHandler)
+    print(f"\\nTurboQuant Server running at http://localhost:{args.port}")
+    print(f"  Model    : {args.model}")
+    print(f"  KV cache : TurboQuant {args.bits}-bit")
+    print(f"  Endpoints:")
+    print(f"    POST /v1/chat/completions")
+    print(f"    GET  /v1/models")
+    print(f"    GET  /health")
+    print()
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\\nShutting down...")
+        server.shutdown()
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
 DEFAULT_TQ_CONFIG = {
     "model": "Qwen/Qwen2.5-3B-Instruct",
     "bits": 4,
@@ -121,7 +405,6 @@ class TurboQuantManager:
 
     def is_turboquant_installed(self) -> bool:
         """Check if turboquant is installed in the shared venv (or system pip as fallback)."""
-        # Check shared venv first
         if VenvManager.is_installed("turboquant"):
             return True
         # Fallback: check system python
@@ -141,7 +424,7 @@ class TurboQuantManager:
         if not VenvManager.ensure(verbose=True):
             ColorOutput.error("Could not create shared venv.")
             return False
-        # accelerate is required by turboquant for device_map support
+        # accelerate is required by transformers for device_map support
         for pkg in ("turboquant", "accelerate"):
             ColorOutput.info(f"Installing {pkg}...")
             if not VenvManager.install(pkg, verbose=True):
@@ -252,6 +535,13 @@ class TurboQuantManager:
             ColorOutput.error("Invalid selection.")
             return self._resolve_port_conflict(port)
 
+
+    def _write_patched_server(self) -> str:
+        """Write patched server script to venv dir and return its path."""
+        script_path = VenvManager.venv_dir() / "tq_server_patched.py"
+        script_path.write_text(PATCHED_SERVER_SCRIPT)
+        return str(script_path)
+
     def start_server(self, model: str, bits: int, port: int, hf_token: str = "") -> bool:
         """Start the TurboQuant inference server in a background thread."""
         if self.is_server_running():
@@ -272,7 +562,7 @@ class TurboQuantManager:
             if port == -1:
                 return False
 
-        py = self.venv_python  # uses venv if installed there, else system python
+        py = self.venv_python
 
         # accelerate is required by transformers for device_map — auto-install if missing
         try:
@@ -288,23 +578,22 @@ class TurboQuantManager:
         except Exception as dep_err:
             ColorOutput.warning(f"Could not verify accelerate: {dep_err}")
 
-        cmd = [
-            py, "-m", "turboquant.server",
-            "--model", model,
-            "--bits", str(bits),
-            "--port", str(port),
-        ]
+        # Write patched server script and launch it (fixes BrokenPipeError + /v1/models)
+        server_script = self._write_patched_server()
+        cmd = [py, server_script, "--model", model, "--bits", str(bits), "--port", str(port)]
 
         env = os.environ.copy()
         if hf_token:
             env["HUGGING_FACE_HUB_TOKEN"] = hf_token
+            env["HF_TOKEN"] = hf_token
 
         ColorOutput.info(f"Starting TurboQuant server...")
         ColorOutput.print(f"  Model : {model}", Colors.WHITE)
-        ColorOutput.print(f"  Bits  : {bits}-bit quantization", Colors.WHITE)
+        ColorOutput.print(f"  Bits  : {bits}-bit KV cache compression", Colors.WHITE)
         ColorOutput.print(f"  Port  : {port}", Colors.WHITE)
         print()
         ColorOutput.print("  (First run will download the model — this may take a while)", Colors.GRAY)
+        ColorOutput.print("  The model loads before the HTTP server opens — this is normal.", Colors.GRAY)
         print()
 
         try:
@@ -315,46 +604,50 @@ class TurboQuantManager:
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
+                start_new_session=True,
             )
         except FileNotFoundError:
             ColorOutput.error("Could not launch python / turboquant. Is it installed?")
             return False
 
         self._server_log_lines = []
+        _print_lock = threading.Lock()
 
-        # Background thread to drain stdout so the pipe doesn't block
         def _drain():
             for line in self._server_proc.stdout:
-                self._server_log_lines.append(line.rstrip())
-                # Print lines that look informative (not spammy)
-                stripped = line.strip()
+                stripped = line.rstrip()
+                self._server_log_lines.append(stripped)
                 if stripped:
-                    print(f"  {Colors.GRAY}{stripped}{Colors.RESET}")
+                    with _print_lock:
+                        print(f"  {Colors.GRAY}{stripped}{Colors.RESET}", flush=True)
 
         self._server_thread = threading.Thread(target=_drain, daemon=True)
         self._server_thread.start()
 
-        # Save what we started
+        # Save config
         self.config["model"] = model
         self.config["bits"] = bits
         self.config["port"] = port
         self.config["last_started"] = time.strftime("%Y-%m-%d %H:%M:%S")
         self._save_config()
 
-        # Poll health endpoint
-        ColorOutput.info(f"Waiting for server to be ready on port {port}...")
-        if self._check_server_health(port, timeout=120):
+        # Brief wait to catch immediate crash (e.g. bad python path, import error)
+        time.sleep(3)
+        if self._server_proc.poll() is not None:
+            self._server_thread.join(timeout=2)
             print()
-            ColorOutput.success(f"TurboQuant server is ready! ✅")
-            ColorOutput.print(f"  API base : http://localhost:{port}/v1", Colors.CYAN)
-            ColorOutput.print(f"  Health   : http://localhost:{port}/health", Colors.CYAN)
-            return True
-        else:
-            print()
-            ColorOutput.warning("Server did not respond in time.")
-            ColorOutput.print("  It may still be downloading the model or loading.", Colors.GRAY)
-            ColorOutput.print(f"  Check manually: curl http://localhost:{port}/health", Colors.CYAN)
+            ColorOutput.error("Server process crashed immediately — see output above.")
+            ColorOutput.print("  Common causes: missing packages (run [I] to reinstall), bad model ID.", Colors.GRAY)
             return False
+
+        print()
+        ColorOutput.success("Server process launched.")
+        ColorOutput.print(f"  The model is loading — the server opens on port {port} once ready.", Colors.YELLOW)
+        ColorOutput.print(f"  This typically takes 1–5 minutes depending on model size.", Colors.GRAY)
+        ColorOutput.print(f"  API   : http://localhost:{port}/v1", Colors.CYAN)
+        ColorOutput.print(f"  Health: http://localhost:{port}/health", Colors.CYAN)
+        ColorOutput.print(f"  Use [5] Test Server to verify it's ready.", Colors.GRAY)
+        return True
 
     def stop_server(self) -> bool:
         """Stop the managed server process."""
@@ -849,6 +1142,85 @@ class TurboQuantManager:
         )
         return True
 
+    # ── Model download ────────────────────────────────────────────────────────
+
+    def download_model(self, model_id: str, hf_token: str = "") -> bool:
+        """
+        Download a HuggingFace model to the local cache now, with visible progress.
+        Uses huggingface_hub (installed alongside transformers/turboquant) so we
+        get the same cache location that turboquant will use later.
+        """
+        py = self.venv_python
+        print()
+        ColorOutput.print(f"Downloading: {model_id}", Colors.CYAN, bold=True)
+        ColorOutput.print("  This may take a while depending on model size and connection speed.", Colors.GRAY)
+        ColorOutput.print("  Progress is shown below. Do NOT close this window.", Colors.YELLOW)
+        print()
+
+        # Build a small inline Python script that downloads with progress printed to stdout
+        script = (
+            "import sys\n"
+            "try:\n"
+            "    from huggingface_hub import snapshot_download\n"
+            "    import os\n"
+            f"    token = {repr(hf_token)} or os.environ.get('HUGGING_FACE_HUB_TOKEN', '')\n"
+            f"    snapshot_download(repo_id={repr(model_id)}, token=token or None)\n"
+            "    print('DOWNLOAD_COMPLETE')\n"
+            "except Exception as e:\n"
+            "    print(f'DOWNLOAD_ERROR: {{e}}', file=sys.stderr)\n"
+            "    sys.exit(1)\n"
+        )
+
+        env = os.environ.copy()
+        if hf_token:
+            env["HUGGING_FACE_HUB_TOKEN"] = hf_token
+        # Force tqdm to output progress to stdout (not stderr) so we capture it
+        env["TQDM_FILE"] = "1"
+
+        try:
+            proc = subprocess.Popen(
+                [py, "-c", script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,   # merge stderr into stdout so we see everything
+                text=True,
+                bufsize=1,
+                env=env,
+            )
+        except Exception as exc:
+            ColorOutput.error(f"Could not launch download process: {exc}")
+            return False
+
+        success = False
+        for line in proc.stdout:
+            stripped = line.rstrip()
+            if stripped == "DOWNLOAD_COMPLETE":
+                success = True
+            elif stripped:
+                # Print raw progress lines from huggingface_hub / tqdm
+                print(f"  {stripped}")
+
+        proc.wait()
+        print()
+        if success and proc.returncode == 0:
+            ColorOutput.success(f"Model downloaded successfully: {model_id}")
+            return True
+        else:
+            ColorOutput.error(f"Download failed or incomplete for: {model_id}")
+            ColorOutput.print("  Check your internet connection and HuggingFace token (if required).", Colors.GRAY)
+            return False
+
+    # ── Server restart ─────────────────────────────────────────────────────────
+
+    def restart_server(self, model: str, bits: int, port: int, hf_token: str = "") -> bool:
+        """Stop the current server and start a new one with the given parameters."""
+        ColorOutput.info("Restarting TurboQuant server...")
+        print()
+        if self.is_server_running():
+            self.stop_server()
+            # Give the OS a moment to release the port
+            time.sleep(2)
+        return self.start_server(model, bits, port, hf_token)
+
     # ── Main menu ─────────────────────────────────────────────────────────────
 
     def show_menu(self):
@@ -906,16 +1278,18 @@ class TurboQuantManager:
             else:
                 ColorOutput.print("  SERVER", Colors.CYAN, bold=True)
                 if not running:
-                    print("    [1] Start Server      (start the currently selected model)")
+                    print("    [1] Start Server")
                 else:
-                    print("    [3] Stop Server       (stop managed server process)")
-                    print("    [4] Force-kill server on port  (if Stop doesn't work)")
-                print("    [K] Stop ALL servers  (kill managed process + free ports 8000 & configured)")
+                    print("    [R] Restart Server    (stop current + start with active model)")
+                    print("    [3] Stop Server")
+                    print("    [4] Force-kill on port  (if Stop doesn't work)")
+                print("    [K] Stop ALL servers  (free port 8000 + configured port)")
+                print("    [Z] Reset Server      (hard-kill + restart with current model)")
                 print()
 
                 ColorOutput.print("  MODELS", Colors.CYAN, bold=True)
-                print("    [S] Select active model   (choose from already-downloaded models)")
-                print("    [D] Download a new model  (browse catalog, downloads on first use)")
+                print("    [S] Select active model   (pick from already-downloaded models)")
+                print("    [D] Download a model      (browse catalog + download now)")
                 print()
 
                 ColorOutput.print("  TEST & INSPECT", Colors.CYAN, bold=True)
@@ -973,13 +1347,45 @@ class TurboQuantManager:
                 self.start_server(model, bits, port, hf_token)
                 input("\nPress Enter to continue...")
 
-            # ── S — select from already-downloaded models ─────────────────────
-            elif choice == "S" and installed:
-                if running:
-                    ColorOutput.warning("Server is currently running.")
-                    ColorOutput.print("  Stop the server first, then change the active model.", Colors.GRAY)
+            # ── R — restart server ────────────────────────────────────────────
+            elif choice == "R" and installed and running:
+                print()
+                ColorOutput.print(f"Restarting with: {model}  ({bits}-bit)  on port {port}", Colors.CYAN)
+                print()
+                self.restart_server(model, bits, port, hf_token)
+                input("\nPress Enter to continue...")
+
+            # ── Z — hard reset: kill everything on port then restart ───────────
+            elif choice == "Z" and installed:
+                print()
+                ColorOutput.print("RESET SERVER", Colors.CYAN, bold=True)
+                ColorOutput.print("Hard-kills any process on the configured port, then starts fresh.", Colors.GRAY)
+                print()
+                # Kill managed process
+                if self.is_server_running():
+                    try:
+                        self._server_proc.terminate()
+                        self._server_proc.wait(timeout=5)
+                    except Exception:
+                        try:
+                            self._server_proc.kill()
+                        except Exception:
+                            pass
+                    self._server_proc = None
+                # Kill anything still holding the port
+                kill_process_on_port(port)
+                time.sleep(2)
+                ColorOutput.success(f"Port {port} cleared.")
+                print()
+                if not model or model == "—":
+                    ColorOutput.warning("No model selected. Use [S] or [D] to set one first.")
                     input("\nPress Enter to continue...")
                     continue
+                self.start_server(model, bits, port, hf_token)
+                input("\nPress Enter to continue...")
+
+            # ── S — select from already-downloaded models ─────────────────────
+            elif choice == "S" and installed:
                 print()
                 new_model, new_bits = self._pick_downloaded_model()
                 if new_model:
@@ -988,27 +1394,41 @@ class TurboQuantManager:
                     self._save_config()
                     print()
                     ColorOutput.success(f"Active model set to: {new_model}  ({new_bits}-bit)")
-                    ColorOutput.print("  Press [1] to start the server.", Colors.GRAY)
+                    if running:
+                        print()
+                        ans = input("Server is running. Restart it with the new model now? (y/n): ").strip().lower()
+                        if ans == "y":
+                            print()
+                            self.restart_server(new_model, new_bits, port, hf_token)
+                    else:
+                        ColorOutput.print("  Press [1] to start the server.", Colors.GRAY)
                     input("\nPress Enter to continue...")
 
-            # ── D — download a new model from the catalog ─────────────────────
+            # ── D — download a model now with visible progress ────────────────
             elif choice == "D" and installed:
                 print()
                 ColorOutput.print("DOWNLOAD A MODEL", Colors.CYAN, bold=True)
-                ColorOutput.print("The model will be downloaded from HuggingFace when you first start the server.", Colors.GRAY)
-                ColorOutput.print("Sizes range from ~1 GB to ~15 GB depending on the model.", Colors.GRAY)
+                ColorOutput.print("Select a model from the catalog. It will be downloaded immediately.", Colors.GRAY)
+                ColorOutput.print("Sizes range from ~1 GB to ~15 GB. Keep this window open.", Colors.GRAY)
                 print()
                 new_model, new_bits = self._pick_model()
                 if new_model:
-                    self.config["model"] = new_model
-                    self.config["bits"]  = new_bits
-                    self._save_config()
-                    print()
-                    ColorOutput.success(f"Configured: {new_model}  ({new_bits}-bit)")
-                    if running:
-                        ColorOutput.warning("Server is running with the old model — restart to apply.")
-                    else:
-                        ColorOutput.print("  Press [1] to start the server (download happens on first launch).", Colors.GRAY)
+                    ok = self.download_model(new_model, hf_token)
+                    if ok:
+                        # Set it as active after successful download
+                        self.config["model"] = new_model
+                        self.config["bits"]  = new_bits
+                        self._save_config()
+                        print()
+                        ColorOutput.success(f"Model ready: {new_model}  ({new_bits}-bit)")
+                        if running:
+                            print()
+                            ans = input("Restart server with new model now? (y/n): ").strip().lower()
+                            if ans == "y":
+                                print()
+                                self.restart_server(new_model, new_bits, port, hf_token)
+                        else:
+                            ColorOutput.print("  Press [1] to start the server.", Colors.GRAY)
                 input("\nPress Enter to continue...")
 
             # ── 3 — stop ─────────────────────────────────────────────────────
