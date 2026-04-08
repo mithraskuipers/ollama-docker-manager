@@ -485,7 +485,7 @@ class VenvManager:
     python  = VenvManager.python()   # path to venv python binary
     pip     = VenvManager.pip()      # path to venv pip binary
     ok      = VenvManager.ensure()   # create venv if missing, return True on success
-    ok      = VenvManager.install("turboquant")   # ensure venv + pip install
+    ok      = VenvManager.install("requests")     # ensure venv + pip install
     present = VenvManager.is_installed("requests") # check if pkg is in venv
     """
 
@@ -574,6 +574,9 @@ class VenvManager:
     def install(package: str, verbose: bool = True) -> bool:
         """
         Ensure the shared venv exists, then pip-install *package* into it.
+        Supports version specifiers such as "numpy<2.4".
+        Passes --upgrade so pip will downgrade if a newer incompatible version
+        is already installed (e.g. numpy 2.4 → numpy 2.3.x).
         Returns True on success.
         """
         if not VenvManager.ensure(verbose=verbose):
@@ -582,8 +585,8 @@ class VenvManager:
             ColorOutput.info(f"Installing {package} into shared venv...")
         try:
             result = subprocess.run(
-                [VenvManager.pip(), "install", package],
-                timeout=180
+                [VenvManager.pip(), "install", "--upgrade", package],
+                timeout=300
             )
             if result.returncode != 0:
                 if verbose:
@@ -601,7 +604,7 @@ class VenvManager:
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Shared network utilities
-# Used by both DockerManager (Ollama) and TurboQuantManager.
+# Used by DockerManager (Ollama).
 # ──────────────────────────────────────────────────────────────────────────────
 
 import time as _time

@@ -10,7 +10,6 @@ Module layout
   menu_handler.py       ← every menu-action method
   system_setup.py       ← Linux/WSL requirements screen & installers
   docker_manager.py     ← Docker / container / model operations
-  turboquant_manager.py ← TurboQuant server management
   utils.py              ← shared data-classes, colors, platform detection
 
 Dependencies
@@ -31,7 +30,6 @@ else:
 
 from utils import Platform, Colors, ColorOutput, PlatformDetector, VenvManager
 from docker_manager import DockerManager
-from turboquant_manager import TurboQuantManager
 from config_manager import ConfigManager
 from menu_handler import MenuHandler
 from system_setup import SystemSetup
@@ -48,11 +46,10 @@ class OllamaManager:
     def __init__(self):
         self.cfg        = ConfigManager()
         self.docker     = DockerManager(self.cfg.config)
-        self.turboquant = TurboQuantManager()
         self.platform   = PlatformDetector.get_platform()
 
-        self.menu  = MenuHandler(self.docker, self.cfg, self.turboquant, self.platform)
-        self.setup = SystemSetup(self.platform, self.turboquant)
+        self.menu  = MenuHandler(self.docker, self.cfg, self.platform)
+        self.setup = SystemSetup(self.platform)
 
     # ── Main menu display ──────────────────────────────────────────────────────
 
@@ -144,19 +141,6 @@ class OllamaManager:
         print()
 
         # ── USE ──────────────────────────────────────────────────────────────
-        tq_running   = self.turboquant.is_server_running()
-        tq_installed = self.turboquant.is_turboquant_installed()
-        if tq_running:
-            tq_label = (
-                f"{Colors.GREEN}RUNNING"
-                f" — port {self.turboquant.config.get('port', 8000)}"
-                f" — {self.turboquant.config.get('model', '?')}{Colors.RESET}"
-            )
-        elif tq_installed:
-            tq_label = f"{Colors.YELLOW}stopped{Colors.RESET}"
-        else:
-            tq_label = f"{Colors.GRAY}not installed{Colors.RESET}"
-
         ColorOutput.print("  USE", Colors.CYAN, bold=True)
         print("    [6] Chat with Model")
         print("    [7] API Info & Network Access")
@@ -164,9 +148,11 @@ class OllamaManager:
         print("    [U] Unload Models from Memory")
         print()
 
-        # ── TURBOQUANT ───────────────────────────────────────────────────────
-        ColorOutput.print("  TURBOQUANT  (HuggingFace / GPU Quantized Inference)", Colors.MAGENTA, bold=True)
-        print(f"    [T] TurboQuant Server Manager  ({tq_label})")
+        ColorOutput.print("  USE", Colors.CYAN, bold=True)
+        print("    [6] Chat with Model")
+        print("    [7] API Info & Network Access")
+        print("    [L] Load Model into Memory")
+        print("    [U] Unload Models from Memory")
         print()
 
         # ── ADVANCED ─────────────────────────────────────────────────────────
@@ -225,9 +211,6 @@ class OllamaManager:
                 elif choice == "7": self.menu.show_api_info()
                 elif choice == "L": self.menu.load_model_menu()
                 elif choice == "U": self.menu.unload_models_menu()
-
-                # TurboQuant
-                elif choice == "T": self.turboquant.show_menu()
 
                 # Advanced
                 elif choice == "S": self.menu.handle_settings()

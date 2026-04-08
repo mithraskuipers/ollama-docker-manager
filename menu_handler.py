@@ -25,15 +25,14 @@ class MenuHandler:
     """
     Implements every menu action as a self-contained method.
 
-    Receives references to the shared docker, config, and turboquant managers
+    Receives references to the shared docker and config managers
     so it never needs to duplicate state.
     """
 
-    def __init__(self, docker_manager, config_manager, turboquant_manager, platform: Platform):
-        self.docker     = docker_manager
-        self.cfg        = config_manager
-        self.turboquant = turboquant_manager
-        self.platform   = platform
+    def __init__(self, docker_manager, config_manager, platform: Platform):
+        self.docker   = docker_manager
+        self.cfg      = config_manager
+        self.platform = platform
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 1 — Install Ollama

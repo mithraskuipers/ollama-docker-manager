@@ -1,7 +1,7 @@
 """
 Ollama Docker Manager - System Setup
 Handles first-run checks, Linux/WSL requirements screen,
-automatic installation of nvidia-container-toolkit, and TurboQuant.
+and automatic installation of nvidia-container-toolkit.
 """
 
 import os
@@ -16,20 +16,19 @@ class SystemSetup:
     First-run system checks and optional installation helpers.
 
     Used by OllamaManager on Linux / WSL to verify that Docker, the NVIDIA
-    driver, nvidia-container-toolkit, and (optionally) TurboQuant are present
-    before the main menu is shown.
+    driver, and nvidia-container-toolkit are present before the main menu
+    is shown.
     """
 
-    def __init__(self, platform: Platform, turboquant_manager):
+    def __init__(self, platform: Platform):
         self.platform = platform
-        self.turboquant = turboquant_manager
 
     # ── Public entry point ─────────────────────────────────────────────────────
 
     def show_linux_requirements(self) -> None:
         """
         Display an interactive requirements overview for Linux / WSL users.
-        Offers to auto-install nvidia-container-toolkit and TurboQuant.
+        Offers to auto-install nvidia-container-toolkit.
         Blocks until the user presses Enter.
         """
         os.system("clear")
@@ -40,11 +39,7 @@ class SystemSetup:
         ColorOutput.print("=" * 65, Colors.CYAN, bold=True)
         print()
         ColorOutput.print(
-            "This manager runs Ollama inside Docker and can also launch",
-            Colors.WHITE,
-        )
-        ColorOutput.print(
-            "TurboQuant for quantized GPU inference.  Both benefit greatly",
+            "This manager runs Ollama inside Docker and benefits greatly",
             Colors.WHITE,
         )
         ColorOutput.print("from a properly configured NVIDIA GPU stack.", Colors.WHITE)
@@ -52,7 +47,6 @@ class SystemSetup:
 
         self._section_core()
         self._section_gpu()
-        self._section_turboquant()
 
         # Summary
         ColorOutput.print("─" * 65, Colors.GRAY)
@@ -128,7 +122,7 @@ class SystemSetup:
             "  GPU REQUIREMENTS  (for NVIDIA GPU acceleration)", Colors.CYAN, bold=True
         )
         ColorOutput.print(
-            "  Needed for: Ollama GPU mode  •  TurboQuant inference", Colors.GRAY
+            "  Needed for: Ollama GPU mode", Colors.GRAY
         )
         ColorOutput.print("─" * 65, Colors.GRAY)
         print()
@@ -179,40 +173,6 @@ class SystemSetup:
 
         # CUDA (informational)
         self._check_cuda()
-
-        print()
-
-    def _section_turboquant(self) -> None:
-        """Check TurboQuant installation and offer to install it."""
-        ColorOutput.print("─" * 65, Colors.GRAY)
-        ColorOutput.print(
-            "  TURBOQUANT REQUIREMENTS  (only if using TurboQuant menu)",
-            Colors.CYAN,
-            bold=True,
-        )
-        ColorOutput.print("─" * 65, Colors.GRAY)
-        print()
-
-        tq_installed = self.turboquant.is_turboquant_installed()
-        if tq_installed:
-            ColorOutput.print("  ✅  turboquant      — pip package installed", Colors.GREEN)
-        else:
-            ColorOutput.print("  ℹ️   turboquant      — not yet installed", Colors.GRAY)
-            print()
-            ColorOutput.print(
-                "  Would you like to install TurboQuant automatically?", Colors.CYAN
-            )
-            print("  This will run:")
-            ColorOutput.print(f"    {VenvManager.pip()} install turboquant", Colors.GRAY)
-            ColorOutput.print(f"    (venv: {VenvManager.venv_dir()})",        Colors.GRAY)
-            print()
-            ans = input("  Install now? (y/n): ").strip().lower()
-            if ans == "y":
-                self.install_turboquant()
-            else:
-                ColorOutput.print(
-                    "  Skipped. You can install later from the [T] menu.", Colors.YELLOW
-                )
 
         print()
 
@@ -348,69 +308,11 @@ class SystemSetup:
                 ColorOutput.print(
                     "      Docker images carry their own CUDA runtime.", Colors.GRAY
                 )
-                ColorOutput.print(
-                    "      TurboQuant needs CUDA libs; install via: sudo apt install nvidia-cuda-toolkit",
-                    Colors.GRAY,
-                )
             return ok
         except Exception:
             return False
 
     # ── Installers ─────────────────────────────────────────────────────────────
-
-    def install_turboquant(self) -> bool:
-        """
-        Install TurboQuant into the shared project venv (~/.ollama-manager-venv).
-        Returns True on success.
-        """
-        venv_python = VenvManager.python()
-        venv_pip    = VenvManager.pip()
-
-        print()
-        ColorOutput.print("=" * 65, Colors.MAGENTA, bold=True)
-        ColorOutput.print("  Installing TurboQuant...", Colors.MAGENTA, bold=True)
-        ColorOutput.print("=" * 65, Colors.MAGENTA, bold=True)
-        print()
-        ColorOutput.print(f"  Shared venv: {VenvManager.venv_dir()}", Colors.GRAY)
-        ColorOutput.print(
-            "  (Isolated from system Python and the rest of this project)", Colors.GRAY
-        )
-        print()
-
-        ColorOutput.print("  Step 1/2: Ensuring shared venv exists", Colors.MAGENTA)
-        ColorOutput.print(f"  Venv: {VenvManager.venv_dir()}", Colors.GRAY)
-        print()
-        if not VenvManager.ensure(verbose=True):
-            ColorOutput.error("Could not create shared venv.")
-            ColorOutput.print(
-                "  Tip: make sure you have internet access and sudo rights.", Colors.YELLOW
-            )
-            return False
-        ColorOutput.success("Step 1 done.")
-        print()
-
-        ColorOutput.print("  Step 2/2: Installing turboquant into shared venv", Colors.MAGENTA)
-        ColorOutput.print(f"  $ {VenvManager.pip()} install turboquant", Colors.GRAY)
-        print()
-        if not VenvManager.install("turboquant", verbose=True):
-            return False
-        ColorOutput.success("Step 2 done.")
-        print()
-
-        # Sync venv python path into TurboQuantManager
-        self.turboquant.venv_python = venv_python
-
-        print()
-        ColorOutput.print("=" * 65, Colors.GREEN, bold=True)
-        ColorOutput.success("TurboQuant installed successfully!")
-        ColorOutput.print("=" * 65, Colors.GREEN, bold=True)
-        print()
-        ColorOutput.print(
-            "  Use [T] TurboQuant in the main menu to start a server.", Colors.CYAN
-        )
-        ColorOutput.print(f"  Python used: {venv_python}", Colors.GRAY)
-        print()
-        return True
 
     def install_nvidia_container_toolkit(self) -> bool:
         """
